@@ -10,6 +10,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/tienphat/m3-repoworker/internal/repo"
+	"github.com/tienphat/m3-repoworker/internal/taskstate"
 )
 
 type StatusInput struct{}
@@ -46,23 +47,41 @@ type ApplyPatchOutput struct {
 	Modified bool   `json:"modified"`
 }
 
+type TaskCreateInput struct {
+	NextAction string `json:"next_action,omitempty" jsonschema:"optional safe handoff note for the next development step"`
+}
+
+type TaskLookupInput struct {
+	TaskID string `json:"task_id" jsonschema:"RepoWorker-generated task identifier"`
+}
+
+type taskManager interface {
+	Create(context.Context, string) (taskstate.State, error)
+	Status(context.Context, string) (taskstate.State, error)
+	Resume(context.Context, string) (taskstate.State, error)
+}
+
 var errRequestRejected = errors.New("request rejected")
 
 func boolPtr(v bool) *bool { return &v }
 
-func newServer(repoRoot string) (*mcp.Server, error) {
+func newServer(repoRoot, stateRoot string) (*mcp.Server, error) {
 	workspace, err := repo.New(repoRoot)
 	if err != nil {
 		return nil, errRequestRejected
 	}
-	return newServerForWorkspace(workspace), nil
+	tasks, err := taskstate.New(repoRoot, stateRoot)
+	if err != nil {
+		return nil, errRequestRejected
+	}
+	return newServerForComponents(workspace, tasks), nil
 }
 
-func newServerForWorkspace(workspace *repo.Workspace) *mcp.Server {
+func newServerForComponents(workspace *repo.Workspace, tasks taskManager) *mcp.Server {
 	server := mcp.NewServer(
 		&mcp.Implementation{
 			Name:    "m3-repoworker",
-			Version: "0.1.0",
+			Version: "0.2.0",
 		},
 		nil,
 	)
@@ -151,6 +170,72 @@ func newServerForWorkspace(workspace *repo.Workspace) *mcp.Server {
 		},
 	)
 
+	mcp.AddTool(
+		server,
+		&mcp.Tool{
+			Name:        "task_create",
+			Title:       "Create development task",
+			Description: "Create persistent RepoWorker handoff state bound to the configured repository, current branch, and HEAD.",
+			Annotations: &mcp.ToolAnnotations{
+				ReadOnlyHint:    false,
+				IdempotentHint:  false,
+				DestructiveHint: boolPtr(false),
+				OpenWorldHint:   boolPtr(false),
+			},
+		},
+		func(ctx context.Context, _ *mcp.CallToolRequest, input TaskCreateInput) (*mcp.CallToolResult, taskstate.State, error) {
+			state, err := tasks.Create(ctx, input.NextAction)
+			if err != nil {
+				return nil, taskstate.State{}, safeToolError(err)
+			}
+			return nil, state, nil
+		},
+	)
+
+	mcp.AddTool(
+		server,
+		&mcp.Tool{
+			Name:        "task_status",
+			Title:       "Read development task",
+			Description: "Return persisted handoff state for one RepoWorker-generated task identifier.",
+			Annotations: &mcp.ToolAnnotations{
+				ReadOnlyHint:    true,
+				IdempotentHint:  true,
+				DestructiveHint: boolPtr(false),
+				OpenWorldHint:   boolPtr(false),
+			},
+		},
+		func(ctx context.Context, _ *mcp.CallToolRequest, input TaskLookupInput) (*mcp.CallToolResult, taskstate.State, error) {
+			state, err := tasks.Status(ctx, input.TaskID)
+			if err != nil {
+				return nil, taskstate.State{}, safeToolError(err)
+			}
+			return nil, state, nil
+		},
+	)
+
+	mcp.AddTool(
+		server,
+		&mcp.Tool{
+			Name:        "task_resume",
+			Title:       "Resume development task",
+			Description: "Resume a persisted task only on its bound repository and branch, refreshing HEAD and forcing RED if it moved.",
+			Annotations: &mcp.ToolAnnotations{
+				ReadOnlyHint:    false,
+				IdempotentHint:  true,
+				DestructiveHint: boolPtr(false),
+				OpenWorldHint:   boolPtr(false),
+			},
+		},
+		func(ctx context.Context, _ *mcp.CallToolRequest, input TaskLookupInput) (*mcp.CallToolResult, taskstate.State, error) {
+			state, err := tasks.Resume(ctx, input.TaskID)
+			if err != nil {
+				return nil, taskstate.State{}, safeToolError(err)
+			}
+			return nil, state, nil
+		},
+	)
+
 	return server
 }
 
@@ -162,16 +247,25 @@ func main() {
 	flags := flag.NewFlagSet("repoworker", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	repoRoot := flags.String("repo-root", "", "absolute repository root")
+	stateRoot := flags.String("state-dir", "", "absolute persistent task state directory outside the repository")
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		log.Fatal("invalid startup configuration")
 	}
-	if err := run(context.Background(), &mcp.StdioTransport{}, *repoRoot); err != nil {
+	resolvedStateRoot := *stateRoot
+	if resolvedStateRoot == "" {
+		var err error
+		resolvedStateRoot, err = taskstate.DefaultStateDir()
+		if err != nil {
+			log.Fatal("invalid startup configuration")
+		}
+	}
+	if err := run(context.Background(), &mcp.StdioTransport{}, *repoRoot, resolvedStateRoot); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func run(ctx context.Context, transport mcp.Transport, repoRoot string) error {
-	server, err := newServer(repoRoot)
+func run(ctx context.Context, transport mcp.Transport, repoRoot, stateRoot string) error {
+	server, err := newServer(repoRoot, stateRoot)
 	if err != nil {
 		return errRequestRejected
 	}
