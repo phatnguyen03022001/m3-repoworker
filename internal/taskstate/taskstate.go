@@ -48,18 +48,18 @@ type Inspector interface {
 
 // State is the persisted handoff record returned through MCP.
 type State struct {
-	Version             int      `json:"version"`
-	TaskID              string   `json:"task_id"`
-	RepoRootIdentity    string   `json:"repo_root_identity"`
-	Branch              string   `json:"branch"`
-	BaseSHA             string   `json:"base_sha"`
-	CurrentHeadSHA      string   `json:"current_head_sha"`
-	LastVerifiedSHA     string   `json:"last_verified_sha"`
-	VerificationState   string   `json:"verification_state"`
-	FailedChecks        []string `json:"failed_checks"`
-	NextAction          string   `json:"next_action"`
-	CreatedAt           string   `json:"created_at"`
-	UpdatedAt           string   `json:"updated_at"`
+	Version           int      `json:"version"`
+	TaskID            string   `json:"task_id"`
+	RepoRootIdentity  string   `json:"repo_root_identity"`
+	Branch            string   `json:"branch"`
+	BaseSHA           string   `json:"base_sha"`
+	CurrentHeadSHA    string   `json:"current_head_sha"`
+	LastVerifiedSHA   string   `json:"last_verified_sha"`
+	VerificationState string   `json:"verification_state"`
+	FailedChecks      []string `json:"failed_checks"`
+	NextAction        string   `json:"next_action"`
+	CreatedAt         string   `json:"created_at"`
+	UpdatedAt         string   `json:"updated_at"`
 }
 
 // Store persists task state outside the repository and binds it to one
@@ -81,9 +81,24 @@ func DefaultStateDir() (string, error) {
 	return filepath.Join(base, "m3-repoworker", "tasks"), nil
 }
 
-// New constructs a task store using a fixed, read-only Git metadata inspector.
+// New constructs a task store using a resolved, fixed Git executable and
+// read-only Git metadata inspection.
 func New(repoRoot, stateRoot string) (*Store, error) {
-	return NewWithInspector(repoRoot, stateRoot, gitInspector{})
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		return nil, ErrRejected
+	}
+	if !filepath.IsAbs(gitPath) {
+		gitPath, err = filepath.Abs(gitPath)
+		if err != nil {
+			return nil, ErrRejected
+		}
+	}
+	gitPath, err = filepath.EvalSymlinks(gitPath)
+	if err != nil || !filepath.IsAbs(gitPath) {
+		return nil, ErrRejected
+	}
+	return NewWithInspector(repoRoot, stateRoot, gitInspector{executable: gitPath})
 }
 
 // NewWithInspector exists so tests can exercise persistence without executing
@@ -96,11 +111,11 @@ func NewWithInspector(repoRoot, stateRoot string, inspector Inspector) (*Store, 
 	if err != nil {
 		return nil, ErrRejected
 	}
-	canonicalState, err := canonicalDirectory(stateRoot, true)
-	if err != nil {
+	if stateRoot == "" || !filepath.IsAbs(stateRoot) || pathWithin(canonicalRepo, filepath.Clean(stateRoot)) {
 		return nil, ErrRejected
 	}
-	if pathWithin(canonicalRepo, canonicalState) {
+	canonicalState, err := canonicalDirectory(stateRoot, true)
+	if err != nil || pathWithin(canonicalRepo, canonicalState) {
 		return nil, ErrRejected
 	}
 
@@ -307,7 +322,7 @@ func validateState(state State) error {
 		return ErrRejected
 	}
 	for _, check := range state.FailedChecks {
-		if check == "" || len(check) > 256 || !utf8.ValidString(check) || strings.ContainsRune(check, 0) {
+		if check == "" || len(check) > 256 || !utf8.ValidString(check) || strings.ContainsRune(check, 0) || containsLikelySecret(check) {
 			return ErrRejected
 		}
 	}
@@ -329,7 +344,25 @@ func validBranch(branch string) bool {
 }
 
 func validNextAction(value string) bool {
-	return len(value) <= maxNextActionBytes && utf8.ValidString(value) && !strings.ContainsRune(value, 0)
+	return len(value) <= maxNextActionBytes && utf8.ValidString(value) && !strings.ContainsRune(value, 0) && !containsLikelySecret(value)
+}
+
+func containsLikelySecret(value string) bool {
+	lower := strings.ToLower(value)
+	for _, marker := range []string{
+		"-----begin private key-----",
+		"-----begin rsa private key-----",
+		"-----begin openssh private key-----",
+		"authorization: bearer ",
+		"github_pat_",
+		"ghp_",
+		"sk-proj-",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func newTaskID() (string, error) {
@@ -368,16 +401,18 @@ func pathWithin(parent, candidate string) bool {
 	return relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative))
 }
 
-type gitInspector struct{}
+type gitInspector struct {
+	executable string
+}
 
-func (gitInspector) Snapshot(ctx context.Context, repoRoot string) (RepositoryState, error) {
-	if ctx == nil {
+func (g gitInspector) Snapshot(ctx context.Context, repoRoot string) (RepositoryState, error) {
+	if ctx == nil || g.executable == "" || !filepath.IsAbs(g.executable) {
 		return RepositoryState{}, ErrRejected
 	}
 	ctx, cancel := context.WithTimeout(ctx, gitTimeout)
 	defer cancel()
 
-	top, err := runGit(ctx, repoRoot, "rev-parse", "--show-toplevel")
+	top, err := runGit(ctx, g.executable, repoRoot, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return RepositoryState{}, ErrRejected
 	}
@@ -385,11 +420,11 @@ func (gitInspector) Snapshot(ctx context.Context, repoRoot string) (RepositorySt
 	if err != nil || filepath.Clean(canonicalTop) != filepath.Clean(repoRoot) {
 		return RepositoryState{}, ErrRejected
 	}
-	branch, err := runGit(ctx, repoRoot, "symbolic-ref", "--quiet", "--short", "HEAD")
+	branch, err := runGit(ctx, g.executable, repoRoot, "symbolic-ref", "--quiet", "--short", "HEAD")
 	if err != nil || !validBranch(branch) {
 		return RepositoryState{}, ErrRejected
 	}
-	head, err := runGit(ctx, repoRoot, "rev-parse", "--verify", "HEAD^{commit}")
+	head, err := runGit(ctx, g.executable, repoRoot, "rev-parse", "--verify", "HEAD^{commit}")
 	if err != nil {
 		return RepositoryState{}, ErrRejected
 	}
@@ -400,10 +435,10 @@ func (gitInspector) Snapshot(ctx context.Context, repoRoot string) (RepositorySt
 	return RepositoryState{Branch: branch, Head: head}, nil
 }
 
-func runGit(ctx context.Context, repoRoot string, args ...string) (string, error) {
+func runGit(ctx context.Context, executable, repoRoot string, args ...string) (string, error) {
 	fixed := []string{"-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", repoRoot}
 	fixed = append(fixed, args...)
-	command := exec.CommandContext(ctx, "git", fixed...)
+	command := exec.CommandContext(ctx, executable, fixed...)
 	command.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"),
