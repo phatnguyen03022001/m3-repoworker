@@ -11,7 +11,7 @@ containerd:
   user: true
 
 ssh:
-  overVsock: true
+  overVsock: false
 
 portForwards:
   - guestIP: "0.0.0.0"
