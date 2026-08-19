@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -105,11 +106,25 @@ func TestRepoStatusTool(t *testing.T) {
 func TestRunTreatsEOFAsCleanShutdown(t *testing.T) {
 	t.Parallel()
 
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "README.md"), "main\n")
+	for _, args := range [][]string{
+		{"init", "-b", "main"},
+		{"config", "user.name", "RepoWorker Test"},
+		{"config", "user.email", "repoworker@example.invalid"},
+		{"add", "README.md"},
+		{"commit", "-m", "initial"},
+	} {
+		commandArgs := append([]string{"-C", root}, args...)
+		if output, err := exec.Command("git", commandArgs...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
 	transport := &mcp.IOTransport{
 		Reader: io.NopCloser(strings.NewReader("")),
 		Writer: nopWriteCloser{Writer: io.Discard},
 	}
-	if err := run(context.Background(), transport, t.TempDir(), t.TempDir()); err != nil {
+	if err := run(context.Background(), transport, root, t.TempDir()); err != nil {
 		t.Fatalf("run() error = %v, want nil", err)
 	}
 }
@@ -249,6 +264,30 @@ func TestMCPTaskToolsAndSanitizedRejection(t *testing.T) {
 	assertSanitizedToolError(t, "task_status", rejected, "/Users/example")
 }
 
+func TestMCPMutationsFailClosedWhenCheckoutLeavesMain(t *testing.T) {
+	root := t.TempDir()
+	tasks := &fakeTaskManager{mainErr: taskstate.ErrMainOnly}
+	client := connectClient(t, root, tasks)
+	ctx := context.Background()
+
+	for _, request := range []struct {
+		name      string
+		arguments map[string]any
+	}{
+		{name: "apply_patch", arguments: map[string]any{"patch": "--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n"}},
+		{name: "create_file", arguments: map[string]any{"path": "new.txt", "content": "new\n"}},
+		{name: "delete_file", arguments: map[string]any{"path": "file.txt"}},
+		{name: "repo_verify", arguments: map[string]any{"check": "fmt"}},
+		{name: "repo_go_mod_tidy", arguments: map[string]any{}},
+	} {
+		result, err := client.CallTool(ctx, &mcp.CallToolParams{Name: request.name, Arguments: request.arguments})
+		if err != nil {
+			t.Fatalf("%s protocol error = %v", request.name, err)
+		}
+		assertSanitizedToolError(t, request.name, result, root)
+	}
+}
+
 func TestVerificationPresetAndEnvironmentAreFixed(t *testing.T) {
 	cases := map[string]string{
 		"fmt":             "fmt-check",
@@ -287,6 +326,7 @@ func (nopWriteCloser) Close() error { return nil }
 type fakeTaskManager struct {
 	state          taskstate.State
 	err            error
+	mainErr        error
 	lastNextAction string
 	lastTaskID     string
 }
@@ -304,6 +344,10 @@ func (f *fakeTaskManager) Status(_ context.Context, taskID string) (taskstate.St
 func (f *fakeTaskManager) Resume(_ context.Context, taskID string) (taskstate.State, error) {
 	f.lastTaskID = taskID
 	return f.state, f.err
+}
+
+func (f *fakeTaskManager) RequireMain(context.Context) error {
+	return f.mainErr
 }
 
 func connectClient(t *testing.T, root string, tasks taskstate.StateStore) *mcp.ClientSession {

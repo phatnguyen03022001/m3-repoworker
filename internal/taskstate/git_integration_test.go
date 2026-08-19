@@ -81,6 +81,31 @@ func TestGitInspectorRejectsReplacementRoot(t *testing.T) {
 	}
 }
 
+func TestGitInspectorRejectsNonMainBranch(t *testing.T) {
+	t.Parallel()
+
+	repoRoot := t.TempDir()
+	stateRoot := t.TempDir()
+	runTestGit(t, repoRoot, "init", "-b", "main")
+	runTestGit(t, repoRoot, "config", "user.name", "RepoWorker Test")
+	runTestGit(t, repoRoot, "config", "user.email", "repoworker@example.invalid")
+	writeGitTestFile(t, filepath.Join(repoRoot, "README.md"), "one\n")
+	runTestGit(t, repoRoot, "add", "README.md")
+	runTestGit(t, repoRoot, "commit", "-m", "initial")
+	runTestGit(t, repoRoot, "switch", "-c", "feature/task")
+	repoFSID, err := filesystemIdentityAtPath(repoRoot)
+	if err != nil {
+		t.Fatalf("filesystemIdentityAtPath() error = %v", err)
+	}
+	store, err := New(repoRoot, repoFSID, stateRoot)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if _, err := store.Create(context.Background(), ""); !errors.Is(err, ErrMainOnly) {
+		t.Fatalf("Create(non-main) error = %v, want ErrMainOnly", err)
+	}
+}
+
 func runTestGit(t *testing.T, repoRoot string, args ...string) {
 	t.Helper()
 	commandArgs := append([]string{"-C", repoRoot}, args...)

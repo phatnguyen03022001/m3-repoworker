@@ -42,6 +42,15 @@ The server uses newline-delimited JSON on standard input and output. Do not
 write human-readable logs to standard output: that stream is reserved for MCP
 messages.
 
+## Main-only authority
+
+RepoWorker enforces a main-only development policy independently of client
+prompts or agent guidance. The configured checkout must be on `main` at
+startup, and every mutating tool re-checks the trusted Git branch before it
+runs. `task_create` and `task_resume` bind only to `main`; a non-main checkout
+fails closed with `repository must be on main`. RepoWorker exposes no branch or
+worktree creation/switching tools, and clients cannot override this policy.
+
 ## Security boundaries
 
 - The MCP server uses stdio only; it does not open a network listener.
@@ -69,13 +78,13 @@ messages.
   file, and the replacement is atomic. File mutations are serialized so two
   concurrent patches cannot both commit from the same stale snapshot.
 - `apply_patch` rejects file creation, deletion, renames, multi-file patches,
-  no-context changes, and protected paths.
+  and protected paths.
 - `task_create` generates the task identifier itself, binds the task to a hash
-  of the canonical repository root plus the current Git branch and commit, and
+  of the canonical repository root plus `main` and the current commit, and
   initializes verification state to `RED`.
 - `task_status` reads only persisted state. `task_resume` refuses a repository
-  or branch mismatch; if the branch HEAD moved, it updates `current_head_sha`
-  and forces the task back to `RED`.
+  mismatch or any checkout that is not on `main`; if the `main` HEAD moved, it
+  updates `current_head_sha` and forces the task back to `RED`.
 - Task state is written outside the repository with private directory/file
   permissions, atomic replace, file and directory sync, bounded strict JSON
   decoding, and repository-identity checks. Corrupt or mismatched state fails

@@ -70,7 +70,7 @@ func TestResumeRefreshesHeadAndForcesRed(t *testing.T) {
 
 	repoRoot := t.TempDir()
 	stateRoot := t.TempDir()
-	inspector := &fakeInspector{state: RepositoryState{Branch: "feature/task", Head: strings.Repeat("a", 40)}}
+	inspector := &fakeInspector{state: RepositoryState{Branch: "main", Head: strings.Repeat("a", 40)}}
 	store, err := NewWithInspector(repoRoot, stateRoot, inspector)
 	if err != nil {
 		t.Fatalf("NewWithInspector() error = %v", err)
@@ -107,7 +107,36 @@ func TestResumeRefreshesHeadAndForcesRed(t *testing.T) {
 	}
 }
 
-func TestResumeRejectsBranchSwitch(t *testing.T) {
+func TestCreateRejectsNonMainBranch(t *testing.T) {
+	t.Parallel()
+
+	store, err := NewWithInspector(t.TempDir(), t.TempDir(), &fakeInspector{state: RepositoryState{Branch: "feature/task", Head: strings.Repeat("a", 40)}})
+	if err != nil {
+		t.Fatalf("NewWithInspector() error = %v", err)
+	}
+	if _, err := store.Create(context.Background(), ""); !errors.Is(err, ErrMainOnly) {
+		t.Fatalf("Create(non-main) error = %v, want ErrMainOnly", err)
+	}
+}
+
+func TestRequireMainRejectsNonMainBranch(t *testing.T) {
+	t.Parallel()
+
+	inspector := &fakeInspector{state: RepositoryState{Branch: "main", Head: strings.Repeat("a", 40)}}
+	store, err := NewWithInspector(t.TempDir(), t.TempDir(), inspector)
+	if err != nil {
+		t.Fatalf("NewWithInspector() error = %v", err)
+	}
+	if err := store.RequireMain(context.Background()); err != nil {
+		t.Fatalf("RequireMain(main) error = %v", err)
+	}
+	inspector.state.Branch = "feature/task"
+	if err := store.RequireMain(context.Background()); !errors.Is(err, ErrMainOnly) {
+		t.Fatalf("RequireMain(non-main) error = %v, want ErrMainOnly", err)
+	}
+}
+
+func TestResumeRejectsLeavingMain(t *testing.T) {
 	t.Parallel()
 
 	repoRoot := t.TempDir()
@@ -122,8 +151,8 @@ func TestResumeRejectsBranchSwitch(t *testing.T) {
 		t.Fatalf("Create() error = %v", err)
 	}
 	inspector.state.Branch = "other"
-	if _, err := store.Resume(context.Background(), created.TaskID); !errors.Is(err, ErrRejected) {
-		t.Fatalf("Resume() error = %v, want ErrRejected", err)
+	if _, err := store.Resume(context.Background(), created.TaskID); !errors.Is(err, ErrMainOnly) {
+		t.Fatalf("Resume() error = %v, want ErrMainOnly", err)
 	}
 }
 
@@ -254,8 +283,8 @@ func runStateStoreContract(t *testing.T, factory func() StateStore, inspector *f
 	}
 
 	inspector.state.Branch = "other"
-	if _, err := restarted.Resume(ctx, created.TaskID); !errors.Is(err, ErrRejected) {
-		t.Fatalf("Resume(branch mismatch) error = %v, want ErrRejected", err)
+	if _, err := restarted.Resume(ctx, created.TaskID); !errors.Is(err, ErrMainOnly) {
+		t.Fatalf("Resume(branch mismatch) error = %v, want ErrMainOnly", err)
 	}
 }
 

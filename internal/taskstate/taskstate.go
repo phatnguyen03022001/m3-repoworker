@@ -23,6 +23,7 @@ import (
 )
 
 const (
+	MainBranch               = "main"
 	stateVersion             = 2
 	maxStateBytes      int64 = 64 << 10
 	maxNextActionBytes       = 4 << 10
@@ -32,6 +33,7 @@ const (
 
 var (
 	ErrRejected = errors.New("task state request rejected")
+	ErrMainOnly = errors.New("repository must be on main")
 	taskIDRE    = regexp.MustCompile(`^task_[0-9a-f]{32}$`)
 	shaRE       = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
 	identityRE  = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -82,6 +84,7 @@ type StateStore interface {
 	Create(context.Context, string) (State, error)
 	Status(context.Context, string) (State, error)
 	Resume(context.Context, string) (State, error)
+	RequireMain(context.Context) error
 }
 
 // JSONStore names the legacy atomic-JSON implementation while callers migrate
@@ -159,7 +162,7 @@ func newBoundWithInspector(repoRoot, repoFSID, stateRoot string, inspector Inspe
 	}, nil
 }
 
-// Create starts a new task bound to the current branch and HEAD. Verification
+// Create starts a new task bound to main and the current HEAD. Verification
 // begins RED by construction.
 func (s *Store) Create(ctx context.Context, nextAction string) (State, error) {
 	s.mu.Lock()
@@ -169,8 +172,14 @@ func (s *Store) Create(ctx context.Context, nextAction string) (State, error) {
 		return State{}, ErrRejected
 	}
 	repoState, err := s.inspector.Snapshot(ctx, s.repoRoot)
+	if errors.Is(err, ErrMainOnly) {
+		return State{}, ErrMainOnly
+	}
 	if err != nil || !validRepositoryState(repoState) {
 		return State{}, ErrRejected
+	}
+	if repoState.Branch != MainBranch {
+		return State{}, ErrMainOnly
 	}
 
 	for attempts := 0; attempts < 4; attempts++ {
@@ -218,7 +227,7 @@ func (s *Store) Status(_ context.Context, taskID string) (State, error) {
 	return s.load(taskID)
 }
 
-// Resume verifies repository identity and branch, refreshes HEAD, and marks the
+// Resume verifies repository identity and main branch, refreshes HEAD, and marks the
 // task RED when HEAD moved since the prior handoff.
 func (s *Store) Resume(ctx context.Context, taskID string) (State, error) {
 	s.mu.Lock()
@@ -229,7 +238,16 @@ func (s *Store) Resume(ctx context.Context, taskID string) (State, error) {
 		return State{}, ErrRejected
 	}
 	repoState, err := s.inspector.Snapshot(ctx, s.repoRoot)
-	if err != nil || !validRepositoryState(repoState) || repoState.Branch != state.Branch {
+	if errors.Is(err, ErrMainOnly) {
+		return State{}, ErrMainOnly
+	}
+	if err != nil || !validRepositoryState(repoState) {
+		return State{}, ErrRejected
+	}
+	if repoState.Branch != MainBranch {
+		return State{}, ErrMainOnly
+	}
+	if repoState.Branch != state.Branch {
 		return State{}, ErrRejected
 	}
 	if repoState.Head == state.CurrentHeadSHA {
@@ -347,7 +365,7 @@ func validateState(state State) error {
 	if !identityRE.MatchString(state.RepoFSIdentity) {
 		return ErrRejected
 	}
-	if !validBranch(state.Branch) || !shaRE.MatchString(state.BaseSHA) || !shaRE.MatchString(state.CurrentHeadSHA) {
+	if state.Branch != MainBranch || !validBranch(state.Branch) || !shaRE.MatchString(state.BaseSHA) || !shaRE.MatchString(state.CurrentHeadSHA) {
 		return ErrRejected
 	}
 	if state.LastVerifiedSHA != "" && !shaRE.MatchString(state.LastVerifiedSHA) {
@@ -369,6 +387,25 @@ func validateState(state State) error {
 	}
 	if _, err := time.Parse(time.RFC3339Nano, state.UpdatedAt); err != nil {
 		return ErrRejected
+	}
+	return nil
+}
+
+// RequireMain is the branch authority used by all mutation callers. It
+// re-reads trusted Git metadata on every request so a checkout moved after
+// startup fails closed instead of relying on a client-declared identity.
+func (s *Store) RequireMain(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.inspector.Snapshot(ctx, s.repoRoot)
+	if err != nil {
+		if errors.Is(err, ErrMainOnly) {
+			return ErrMainOnly
+		}
+		return ErrRejected
+	}
+	if state.Branch != MainBranch {
+		return ErrMainOnly
 	}
 	return nil
 }
@@ -487,6 +524,9 @@ func (g gitInspector) Snapshot(ctx context.Context, repoRoot string) (Repository
 	branch, err := runGit(ctx, g.executable, repoRoot, "symbolic-ref", "--quiet", "--short", "HEAD")
 	if err != nil || !validBranch(branch) || !pathMatchesFilesystemIdentity(repoRoot, g.repoFSID) {
 		return RepositoryState{}, ErrRejected
+	}
+	if branch != MainBranch {
+		return RepositoryState{}, ErrMainOnly
 	}
 	head, err := runGit(ctx, g.executable, repoRoot, "rev-parse", "--verify", "HEAD^{commit}")
 	if err != nil {

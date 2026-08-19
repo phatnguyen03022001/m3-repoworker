@@ -100,6 +100,13 @@ type TaskLookupInput struct {
 	TaskID string `json:"task_id" jsonschema:"RepoWorker-generated task identifier"`
 }
 
+func requireMain(ctx context.Context, tasks taskstate.StateStore) error {
+	if ctx == nil || tasks == nil {
+		return taskstate.ErrRejected
+	}
+	return tasks.RequireMain(ctx)
+}
+
 var errRequestRejected = errors.New("request rejected")
 
 func boolPtr(v bool) *bool { return &v }
@@ -224,6 +231,10 @@ func newServer(repoRoot, stateRoot string) (*mcp.Server, *repo.Workspace, error)
 		_ = workspace.Close()
 		return nil, nil, errRequestRejected
 	}
+	if err := tasks.RequireMain(context.Background()); err != nil {
+		_ = workspace.Close()
+		return nil, nil, errRequestRejected
+	}
 	return newServerForComponents(workspace, tasks), workspace, nil
 }
 
@@ -333,7 +344,10 @@ func newServerForComponents(workspace *repo.Workspace, tasks taskstate.StateStor
 				OpenWorldHint:   boolPtr(false),
 			},
 		},
-		func(_ context.Context, _ *mcp.CallToolRequest, input ApplyPatchInput) (*mcp.CallToolResult, ApplyPatchOutput, error) {
+		func(ctx context.Context, _ *mcp.CallToolRequest, input ApplyPatchInput) (*mcp.CallToolResult, ApplyPatchOutput, error) {
+			if err := requireMain(ctx, tasks); err != nil {
+				return nil, ApplyPatchOutput{}, safeToolError(err)
+			}
 			path, err := workspace.ApplyPatch(input.Patch)
 			if err != nil {
 				return nil, ApplyPatchOutput{}, safeToolError(err)
@@ -355,7 +369,10 @@ func newServerForComponents(workspace *repo.Workspace, tasks taskstate.StateStor
 				OpenWorldHint:   boolPtr(false),
 			},
 		},
-		func(_ context.Context, _ *mcp.CallToolRequest, input CreateFileInput) (*mcp.CallToolResult, CreateFileOutput, error) {
+		func(ctx context.Context, _ *mcp.CallToolRequest, input CreateFileInput) (*mcp.CallToolResult, CreateFileOutput, error) {
+			if err := requireMain(ctx, tasks); err != nil {
+				return nil, CreateFileOutput{}, safeToolError(err)
+			}
 			path, err := workspace.CreateFile(input.Path, input.Content)
 			if err != nil {
 				return nil, CreateFileOutput{}, safeToolError(err)
@@ -377,7 +394,10 @@ func newServerForComponents(workspace *repo.Workspace, tasks taskstate.StateStor
 				OpenWorldHint:   boolPtr(false),
 			},
 		},
-		func(_ context.Context, _ *mcp.CallToolRequest, input DeleteFileInput) (*mcp.CallToolResult, DeleteFileOutput, error) {
+		func(ctx context.Context, _ *mcp.CallToolRequest, input DeleteFileInput) (*mcp.CallToolResult, DeleteFileOutput, error) {
+			if err := requireMain(ctx, tasks); err != nil {
+				return nil, DeleteFileOutput{}, safeToolError(err)
+			}
 			path, err := workspace.DeleteFile(input.Path)
 			if err != nil {
 				return nil, DeleteFileOutput{}, safeToolError(err)
@@ -400,6 +420,9 @@ func newServerForComponents(workspace *repo.Workspace, tasks taskstate.StateStor
 			},
 		},
 		func(ctx context.Context, _ *mcp.CallToolRequest, input RepoVerifyInput) (*mcp.CallToolResult, RepoVerifyOutput, error) {
+			if err := requireMain(ctx, tasks); err != nil {
+				return nil, RepoVerifyOutput{}, safeToolError(err)
+			}
 			target, timeout, ok := verificationPreset(input.Check)
 			if !ok {
 				return nil, RepoVerifyOutput{}, errRequestRejected
@@ -434,6 +457,9 @@ func newServerForComponents(workspace *repo.Workspace, tasks taskstate.StateStor
 			},
 		},
 		func(ctx context.Context, _ *mcp.CallToolRequest, _ GoModTidyInput) (*mcp.CallToolResult, GoModTidyOutput, error) {
+			if err := requireMain(ctx, tasks); err != nil {
+				return nil, GoModTidyOutput{}, safeToolError(err)
+			}
 			root, err := workspace.DuplicateRoot()
 			if err != nil {
 				return nil, GoModTidyOutput{}, safeToolError(err)
@@ -458,7 +484,7 @@ func newServerForComponents(workspace *repo.Workspace, tasks taskstate.StateStor
 		&mcp.Tool{
 			Name:        "task_create",
 			Title:       "Create development task",
-			Description: "Create persistent RepoWorker handoff state bound to the configured repository, current branch, and HEAD.",
+			Description: "Create persistent RepoWorker handoff state bound to the configured repository, main branch, and HEAD.",
 			Annotations: &mcp.ToolAnnotations{
 				ReadOnlyHint:    false,
 				IdempotentHint:  false,
@@ -502,7 +528,7 @@ func newServerForComponents(workspace *repo.Workspace, tasks taskstate.StateStor
 		&mcp.Tool{
 			Name:        "task_resume",
 			Title:       "Resume development task",
-			Description: "Resume a persisted task only on its bound repository and branch, refreshing HEAD and forcing RED if it moved.",
+			Description: "Resume a persisted task only on its bound repository and main branch, refreshing HEAD and forcing RED if it moved.",
 			Annotations: &mcp.ToolAnnotations{
 				ReadOnlyHint:    false,
 				IdempotentHint:  true,
