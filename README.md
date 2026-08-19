@@ -38,6 +38,58 @@ The same `-repo-root` argument must be present when another process such as
 implicit repository root. If `-state-dir` is supplied it must also remain
 outside the configured repository.
 
+### Local tunnel operations
+
+The configured local tunnel uses the `local-stdio` profile at
+`~/.config/tunnel-client/local-stdio.yaml`. The profile launches:
+
+```text
+/Users/tienphat/Developer/m3-repoworker/bin/repoworker \
+  -repo-root /Users/tienphat/Developer/m3-repoworker
+```
+
+Build and verify the binary before starting or restarting the tunnel:
+
+```sh
+make verify
+```
+
+The credential is supplied through `CONTROL_PLANE_API_KEY`; do not print or
+commit its value. The credential-safe restart wrapper loads `.env` privately,
+stops the old listener, and starts a single tunnel on `127.0.0.1:8080`:
+
+```sh
+./scripts/restart-local-tunnel.sh
+```
+
+The equivalent direct start command, when `CONTROL_PLANE_API_KEY` is already
+exported in the shell, is:
+
+```sh
+tunnel-client run --profile local-stdio
+```
+
+Check configuration and runtime health without exposing credentials:
+
+```sh
+tunnel-client doctor --profile local-stdio --explain
+lsof -nP -iTCP:8080 -sTCP:LISTEN
+curl -fsS http://127.0.0.1:8080/healthz
+curl -fsS http://127.0.0.1:8080/readyz
+tail -f /private/tmp/m3-tunnel.log
+```
+
+Confirm the local binary still advertises all 12 RepoWorker tools:
+
+```sh
+go test ./cmd/repoworker -run TestRepoStatusTool -count=1
+```
+
+If ChatGPT shows an older 7-tool schema while the local test and tunnel logs
+are correct, reconnect or remove and re-add the MCP connector, then open a new
+ChatGPT session. This refreshes the external connector registration; changing
+RepoWorker is not a workaround for a cached connector schema.
+
 The server uses newline-delimited JSON on standard input and output. Do not
 write human-readable logs to standard output: that stream is reserved for MCP
 messages.
