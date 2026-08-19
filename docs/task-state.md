@@ -13,6 +13,7 @@ The implementation must preserve these invariants:
 7. Persistent state lives outside the repository and is atomically replaced.
 8. Corrupt, oversized, unknown-field, mismatched, or malformed state fails closed.
 9. MCP-visible failures are sanitized to `request rejected`.
-10. Git access is fixed local metadata inspection only; no shell, hooks, prompts, network access, GitHub credentials, publishing, or arbitrary Git arguments.
+10. High-confidence credential material is rejected from persisted handoff text.
+11. Git access is fixed local metadata inspection only; no shell, hooks, prompts, network access, GitHub credentials, publishing, or arbitrary Git arguments.
 
 Final publish authority remains reserved for the future independent Gatekeeper.
