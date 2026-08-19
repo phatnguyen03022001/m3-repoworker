@@ -548,7 +548,10 @@ func newServerForComponents(workspace *repo.Workspace, tasks taskstate.StateStor
 	return server
 }
 
-func safeToolError(error) error {
+func safeToolError(err error) error {
+	if errors.Is(err, taskstate.ErrMainOnly) {
+		return taskstate.ErrMainOnly
+	}
 	return errRequestRejected
 }
 

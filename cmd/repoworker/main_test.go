@@ -284,7 +284,7 @@ func TestMCPMutationsFailClosedWhenCheckoutLeavesMain(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s protocol error = %v", request.name, err)
 		}
-		assertSanitizedToolError(t, request.name, result, root)
+		assertMainOnlyToolError(t, request.name, result)
 	}
 }
 
@@ -391,6 +391,17 @@ func assertSanitizedToolError(t *testing.T, name string, result *mcp.CallToolRes
 	text, ok := result.Content[0].(*mcp.TextContent)
 	if !ok || text.Text != "request rejected" || strings.Contains(text.Text, forbidden) || strings.Contains(text.Text, ".env") {
 		t.Errorf("%s unsanitized error content = %#v", name, result.Content)
+	}
+}
+
+func assertMainOnlyToolError(t *testing.T, name string, result *mcp.CallToolResult) {
+	t.Helper()
+	if !result.IsError || len(result.Content) != 1 {
+		t.Fatalf("%s rejected result = %#v, want one tool error", name, result)
+	}
+	text, ok := result.Content[0].(*mcp.TextContent)
+	if !ok || text.Text != "repository must be on main" {
+		t.Errorf("%s error content = %#v, want main-only rejection", name, result.Content)
 	}
 }
 

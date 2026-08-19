@@ -92,7 +92,8 @@ worktree creation/switching tools, and clients cannot override this policy.
 - Git use is limited to fixed local metadata reads (`rev-parse` and
   `symbolic-ref`) with no shell, hooks, prompts, network operations, or arbitrary
   command input. RepoWorker still has no GitHub credentials and cannot publish.
-- Rejected MCP requests return only `request rejected`, never a filesystem
+- Rejected MCP requests return only `request rejected`, except for the safe
+  policy message `repository must be on main`; they never return a filesystem
   path, repository root, protected filename, task-state location, or underlying
   host error.
 - `repo_status`, `repo_read`, `repo_search`, and `task_status` are read-only,
