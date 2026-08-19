@@ -2,6 +2,7 @@
 package repo
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"os"
@@ -9,14 +10,19 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 )
 
 const (
-	maxFileBytes  int64 = 1 << 20
-	maxPatchBytes       = 256 << 10
-	maxQueryBytes       = 512
-	maxMatches          = 100
+	maxFileBytes          int64 = 1 << 20
+	maxPatchBytes               = 256 << 10
+	maxQueryBytes               = 512
+	maxMatches                  = 100
+	maxMatchTextBytes           = 4 << 10
+	maxSearchOutputBytes        = 256 << 10
+	defaultMaxSearchFiles       = 10_000
+	defaultMaxSearchBytes int64 = 64 << 20
 )
 
 var (
@@ -30,15 +36,19 @@ var (
 
 // Workspace confines every operation to one canonical repository root.
 type Workspace struct {
-	root string
+	root           string
+	mu             sync.RWMutex
+	maxSearchFiles int
+	maxSearchBytes int64
 }
 
 // Match is one literal search result. Path is always relative to the
 // configured repository root.
 type Match struct {
-	Path string `json:"path"`
-	Line int    `json:"line"`
-	Text string `json:"text"`
+	Path      string `json:"path"`
+	Line      int    `json:"line"`
+	Text      string `json:"text"`
+	Truncated bool   `json:"truncated,omitempty"`
 }
 
 // SearchResult contains the bounded set of literal search matches.
@@ -66,12 +76,19 @@ func New(root string) (*Workspace, error) {
 		return nil, ErrConfig
 	}
 
-	return &Workspace{root: filepath.Clean(canonicalRoot)}, nil
+	return &Workspace{
+		root:           filepath.Clean(canonicalRoot),
+		maxSearchFiles: defaultMaxSearchFiles,
+		maxSearchBytes: defaultMaxSearchBytes,
+	}, nil
 }
 
 // Read returns one UTF-8 text file. It rejects protected, non-regular, large,
 // and escaped files.
 func (w *Workspace) Read(path string) (string, string, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
 	target, relativePath, err := w.resolveExisting(path, false)
 	if err != nil {
 		return "", "", ErrRejected
@@ -85,9 +102,17 @@ func (w *Workspace) Read(path string) (string, string, error) {
 
 // Search performs a bounded literal text search. It never follows symlinks
 // while walking and skips all protected, binary, and oversized files.
-func (w *Workspace) Search(query, scope string) (SearchResult, error) {
-	if query == "" || len(query) > maxQueryBytes || !utf8.ValidString(query) {
+func (w *Workspace) Search(ctx context.Context, query, scope string) (SearchResult, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	if ctx == nil || query == "" || len(query) > maxQueryBytes || !utf8.ValidString(query) {
 		return SearchResult{}, ErrRejected
+	}
+	select {
+	case <-ctx.Done():
+		return SearchResult{}, ErrRejected
+	default:
 	}
 
 	searchRoot := w.root
@@ -108,7 +133,15 @@ func (w *Workspace) Search(query, scope string) (SearchResult, error) {
 	}
 
 	result := SearchResult{}
+	filesScanned := 0
+	var bytesScanned int64
+	outputBytes := 0
 	err = filepath.WalkDir(searchRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+		select {
+		case <-ctx.Done():
+			return ErrRejected
+		default:
+		}
 		if walkErr != nil {
 			return ErrRejected
 		}
@@ -132,16 +165,32 @@ func (w *Workspace) Search(query, scope string) (SearchResult, error) {
 			return nil
 		}
 
-		matches, err := searchTextFile(query, path, relativePath)
+		entryInfo, err := entry.Info()
+		if err != nil || entryInfo.Size() > maxFileBytes {
+			return nil
+		}
+		if filesScanned >= w.maxSearchFiles || entryInfo.Size() > w.maxSearchBytes-bytesScanned {
+			result.Truncated = true
+			return errStopWalk
+		}
+		filesScanned++
+		bytesScanned += entryInfo.Size()
+
+		matches, used, truncated, err := searchTextFile(
+			query,
+			path,
+			relativePath,
+			maxMatches-len(result.Matches),
+			maxSearchOutputBytes-outputBytes,
+		)
 		if err != nil {
 			return nil // Unsupported file types and unreadable files are skipped.
 		}
-		for _, match := range matches {
-			if len(result.Matches) == maxMatches {
-				result.Truncated = true
-				return errStopWalk
-			}
-			result.Matches = append(result.Matches, match)
+		result.Matches = append(result.Matches, matches...)
+		outputBytes += used
+		if truncated || len(result.Matches) == maxMatches || outputBytes >= maxSearchOutputBytes {
+			result.Truncated = true
+			return errStopWalk
 		}
 		return nil
 	})
@@ -156,22 +205,21 @@ func (w *Workspace) searchFile(query, path string) (SearchResult, error) {
 	if err != nil || isProtected(relativePath) {
 		return SearchResult{}, ErrRejected
 	}
-	matches, err := searchTextFile(query, path, relativePath)
+	matches, _, truncated, err := searchTextFile(query, path, relativePath, maxMatches, maxSearchOutputBytes)
 	if err != nil {
 		return SearchResult{}, ErrRejected
 	}
-	result := SearchResult{Matches: matches}
-	if len(result.Matches) > maxMatches {
-		result.Matches = result.Matches[:maxMatches]
-		result.Truncated = true
-	}
-	return result, nil
+	return SearchResult{Matches: matches, Truncated: truncated}, nil
 }
 
 // ApplyPatch applies one strict, single-file unified diff to an existing text
 // file. Every hunk must match exactly; the file is atomically replaced only
-// after all validation succeeds.
+// after all validation succeeds. Mutations are serialized so concurrent exact-
+// context patches cannot both commit from the same stale snapshot.
 func (w *Workspace) ApplyPatch(patch string) (string, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
 	if len(patch) == 0 || len(patch) > maxPatchBytes || !utf8.ValidString(patch) {
 		return "", ErrRejected
 	}
@@ -266,19 +314,36 @@ func isProtected(relativePath string) bool {
 		if name == ".git" || name == ".env" || strings.HasPrefix(name, ".env.") {
 			return true
 		}
-		if strings.Contains(name, "credential") || strings.Contains(name, "secret") || strings.Contains(name, "token") {
-			return true
-		}
 		switch name {
-		case ".netrc", ".npmrc", ".pypirc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "private_key", "privatekey", "authorized_keys":
+		case ".netrc", ".npmrc", ".pypirc", ".ssh", ".aws", ".gnupg",
+			"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "private_key", "privatekey", "authorized_keys",
+			"credentials.json", "credentials.yaml", "credentials.yml",
+			"secret.json", "secret.yaml", "secret.yml", "secrets.json", "secrets.yaml", "secrets.yml",
+			"token.json", "token.yaml", "token.yml", "tokens.json", "tokens.yaml", "tokens.yml":
 			return true
 		}
 		extension := strings.ToLower(filepath.Ext(name))
 		if extension == ".key" || extension == ".pem" || extension == ".p12" || extension == ".pfx" || extension == ".token" {
 			return true
 		}
+		if containsSensitiveKeyword(name) && !isSourceCodePath(name) {
+			return true
+		}
 	}
 	return false
+}
+
+func containsSensitiveKeyword(name string) bool {
+	return strings.Contains(name, "credential") || strings.Contains(name, "secret") || strings.Contains(name, "token")
+}
+
+func isSourceCodePath(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".c", ".cc", ".cpp", ".cs", ".go", ".h", ".hpp", ".java", ".js", ".jsx", ".kt", ".kts", ".m", ".mm", ".php", ".py", ".rb", ".rs", ".scala", ".sh", ".swift", ".ts", ".tsx", ".zsh":
+		return true
+	default:
+		return false
+	}
 }
 
 func readTextFile(path string) (string, error) {
@@ -293,19 +358,60 @@ func readTextFile(path string) (string, error) {
 	return string(content), nil
 }
 
-func searchTextFile(query, path, relativePath string) ([]Match, error) {
+func searchTextFile(query, path, relativePath string, matchLimit, outputLimit int) ([]Match, int, bool, error) {
+	if matchLimit <= 0 || outputLimit <= 0 {
+		return nil, 0, true, nil
+	}
 	content, err := readTextFile(path)
 	if err != nil {
-		return nil, err
+		return nil, 0, false, err
 	}
 	lines := strings.Split(content, "\n")
 	matches := make([]Match, 0)
+	used := 0
 	for index, line := range lines {
-		if strings.Contains(line, query) {
-			matches = append(matches, Match{Path: relativePath, Line: index + 1, Text: line})
+		if !strings.Contains(line, query) {
+			continue
+		}
+		preview, previewTruncated := matchPreview(line, query)
+		match := Match{Path: relativePath, Line: index + 1, Text: preview, Truncated: previewTruncated}
+		cost := len(match.Path) + len(match.Text) + 64
+		if len(matches) == matchLimit || cost > outputLimit-used {
+			return matches, used, true, nil
+		}
+		matches = append(matches, match)
+		used += cost
+	}
+	return matches, used, false, nil
+}
+
+func matchPreview(line, query string) (string, bool) {
+	if len(line) <= maxMatchTextBytes {
+		return line, false
+	}
+	matchIndex := strings.Index(line, query)
+	if matchIndex < 0 {
+		matchIndex = 0
+	}
+	start := matchIndex - (maxMatchTextBytes-len(query))/2
+	if start < 0 {
+		start = 0
+	}
+	end := start + maxMatchTextBytes
+	if end > len(line) {
+		end = len(line)
+		start = end - maxMatchTextBytes
+		if start < 0 {
+			start = 0
 		}
 	}
-	return matches, nil
+	for start < end && !utf8.RuneStart(line[start]) {
+		start++
+	}
+	for end > start && !utf8.ValidString(line[start:end]) {
+		end--
+	}
+	return line[start:end], true
 }
 
 func hasSymlinkComponent(root, relativePath string) bool {
@@ -433,20 +539,20 @@ func applyHunks(content string, hunks []hunk) (string, error) {
 	updated := make([]string, 0, len(original))
 	cursor := 0
 	for _, hunk := range hunks {
-		start := hunk.oldStart
-		if start > 0 {
-			start--
-		}
+		start := hunk.oldStart - 1
 		if start < cursor || start > len(original) {
 			return "", ErrRejected
 		}
 		updated = append(updated, original[cursor:start]...)
+
+		position := start
 		oldLines := 0
 		for _, line := range hunk.lines {
 			if line.kind != '+' {
-				if cursor+oldLines >= len(original) || original[cursor+oldLines] != line.text {
+				if position >= len(original) || original[position] != line.text {
 					return "", ErrRejected
 				}
+				position++
 				oldLines++
 			}
 			if line.kind != '-' {
@@ -456,7 +562,7 @@ func applyHunks(content string, hunks []hunk) (string, error) {
 		if oldLines != hunk.oldCount {
 			return "", ErrRejected
 		}
-		cursor += oldLines
+		cursor = position
 	}
 	updated = append(updated, original[cursor:]...)
 	return strings.Join(updated, "\n") + "\n", nil
