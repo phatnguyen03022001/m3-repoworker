@@ -1,0 +1,21 @@
+vmType: vz
+arch: aarch64
+
+base:
+  - template:_images/ubuntu
+
+mounts: []
+
+containerd:
+  system: false
+  user: true
+
+ssh:
+  overVsock: true
+
+portForwards:
+  - guestIP: "0.0.0.0"
+    guestPortRange: [1, 65535]
+    ignore: true
+
+networks: []
