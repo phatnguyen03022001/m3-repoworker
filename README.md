@@ -49,6 +49,11 @@ messages.
   is canonicalized before use. Repo paths are always relative to that root.
   Absolute paths, `..` traversal, Windows volume paths, backslashes, and
   symlink escapes are rejected.
+- The repository root is also opened once at startup and assigned an opaque
+  filesystem identity derived from its device/inode identity. New task state is
+  bound to that identity. Repository read, search, and patch operations resolve
+  from the opened root with FD-relative operations, `O_NOFOLLOW`, and device-
+  crossing checks rather than reopening the startup pathname.
 - `repo_read` and `repo_search` only handle bounded UTF-8 regular files. They
   do not follow symlinks while searching and never expose `.git`, `.env`,
   `.env.*`, common credential/secret/token stores, private keys, or common key
@@ -99,6 +104,7 @@ A task persists these development fields across RepoWorker restarts:
 
 - `task_id`
 - `repo_root_identity`
+- `repo_filesystem_identity`
 - `branch`
 - `base_sha`
 - `current_head_sha`
@@ -113,7 +119,8 @@ phase never manufactures a GREEN state.
 ## Current scope
 
 RepoWorker currently implements repository status, confined read/search,
-strict patch application, and persistent task create/status/resume handoff.
+deterministic FD-relative snapshot manifests, strict patch application, and
+persistent task create/status/resume handoff.
 Verification execution, Gatekeeper authority, candidate binding, and publishing
 are intentionally not implemented yet. A green local `make verify` is a
 development check, not final publish authorization.

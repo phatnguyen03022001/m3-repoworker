@@ -1,7 +1,7 @@
 GOCACHE ?= $(CURDIR)/.cache/go-build
 BIN_DIR ?= bin
 
-.PHONY: build fmt-check test test-race mcp-integration vet mod-verify lima verify
+.PHONY: build fmt-check test test-race mcp-integration vet mod-verify lima ci verify
 
 build:
 	mkdir -p $(BIN_DIR)
@@ -28,4 +28,6 @@ mod-verify:
 lima:
 	limactl validate repoworker-prod.yaml
 
-verify: fmt-check vet test test-race mcp-integration mod-verify build lima
+ci: fmt-check vet test test-race mcp-integration mod-verify build
+
+verify: ci lima

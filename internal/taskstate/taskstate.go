@@ -18,10 +18,12 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
-	stateVersion             = 1
+	stateVersion             = 2
 	maxStateBytes      int64 = 64 << 10
 	maxNextActionBytes       = 4 << 10
 	maxBranchBytes           = 256
@@ -51,6 +53,7 @@ type State struct {
 	Version           int      `json:"version"`
 	TaskID            string   `json:"task_id"`
 	RepoRootIdentity  string   `json:"repo_root_identity"`
+	RepoFSIdentity    string   `json:"repo_filesystem_identity,omitempty"`
 	Branch            string   `json:"branch"`
 	BaseSHA           string   `json:"base_sha"`
 	CurrentHeadSHA    string   `json:"current_head_sha"`
@@ -68,9 +71,24 @@ type Store struct {
 	repoRoot     string
 	stateRoot    string
 	repoIdentity string
+	repoFSID     string
 	inspector    Inspector
 	mu           sync.Mutex
 }
+
+// StateStore is the persistent task-state contract consumed by the MCP layer.
+// Implementations must preserve fail-closed repository binding semantics.
+type StateStore interface {
+	Create(context.Context, string) (State, error)
+	Status(context.Context, string) (State, error)
+	Resume(context.Context, string) (State, error)
+}
+
+// JSONStore names the legacy atomic-JSON implementation while callers migrate
+// to the StateStore contract.
+type JSONStore = Store
+
+var _ StateStore = (*JSONStore)(nil)
 
 // DefaultStateDir returns the per-user persistent state directory.
 func DefaultStateDir() (string, error) {
@@ -83,7 +101,11 @@ func DefaultStateDir() (string, error) {
 
 // New constructs a task store using a resolved, fixed Git executable and
 // read-only Git metadata inspection.
-func New(repoRoot, stateRoot string) (*Store, error) {
+func New(repoRoot, repoFSID, stateRoot string) (*Store, error) {
+	canonicalRepo, err := canonicalDirectory(repoRoot, false)
+	if err != nil || !pathMatchesFilesystemIdentity(canonicalRepo, repoFSID) {
+		return nil, ErrRejected
+	}
 	gitPath, err := exec.LookPath("git")
 	if err != nil {
 		return nil, ErrRejected
@@ -98,32 +120,41 @@ func New(repoRoot, stateRoot string) (*Store, error) {
 	if err != nil || !filepath.IsAbs(gitPath) {
 		return nil, ErrRejected
 	}
-	return NewWithInspector(repoRoot, stateRoot, gitInspector{executable: gitPath})
+	return newBoundWithInspector(canonicalRepo, repoFSID, stateRoot, gitInspector{executable: gitPath, repoFSID: repoFSID})
 }
 
 // NewWithInspector exists so tests can exercise persistence without executing
 // Git. The production caller uses New.
 func NewWithInspector(repoRoot, stateRoot string, inspector Inspector) (*Store, error) {
-	if inspector == nil {
-		return nil, ErrRejected
-	}
 	canonicalRepo, err := canonicalDirectory(repoRoot, false)
 	if err != nil {
 		return nil, ErrRejected
 	}
-	if stateRoot == "" || !filepath.IsAbs(stateRoot) || pathWithin(canonicalRepo, filepath.Clean(stateRoot)) {
+	digest := sha256.Sum256([]byte(canonicalRepo))
+	return newBoundWithInspector(canonicalRepo, hex.EncodeToString(digest[:]), stateRoot, inspector)
+}
+
+func newBoundWithInspector(repoRoot, repoFSID, stateRoot string, inspector Inspector) (*Store, error) {
+	if inspector == nil {
+		return nil, ErrRejected
+	}
+	if repoRoot == "" || !filepath.IsAbs(repoRoot) || filepath.Clean(repoRoot) != repoRoot || !identityRE.MatchString(repoFSID) {
+		return nil, ErrRejected
+	}
+	if stateRoot == "" || !filepath.IsAbs(stateRoot) || pathWithin(repoRoot, filepath.Clean(stateRoot)) {
 		return nil, ErrRejected
 	}
 	canonicalState, err := canonicalDirectory(stateRoot, true)
-	if err != nil || pathWithin(canonicalRepo, canonicalState) {
+	if err != nil || pathWithin(repoRoot, canonicalState) {
 		return nil, ErrRejected
 	}
 
-	digest := sha256.Sum256([]byte(canonicalRepo))
+	digest := sha256.Sum256([]byte(repoRoot))
 	return &Store{
-		repoRoot:     canonicalRepo,
+		repoRoot:     repoRoot,
 		stateRoot:    canonicalState,
 		repoIdentity: hex.EncodeToString(digest[:]),
+		repoFSID:     repoFSID,
 		inspector:    inspector,
 	}, nil
 }
@@ -152,6 +183,7 @@ func (s *Store) Create(ctx context.Context, nextAction string) (State, error) {
 			Version:           stateVersion,
 			TaskID:            taskID,
 			RepoRootIdentity:  s.repoIdentity,
+			RepoFSIdentity:    s.repoFSID,
 			Branch:            repoState.Branch,
 			BaseSHA:           repoState.Head,
 			CurrentHeadSHA:    repoState.Head,
@@ -241,11 +273,14 @@ func (s *Store) load(taskID string) (State, error) {
 	if err := validateState(state); err != nil || state.TaskID != taskID || state.RepoRootIdentity != s.repoIdentity {
 		return State{}, ErrRejected
 	}
+	if s.repoFSID != "" && state.RepoFSIdentity != s.repoFSID {
+		return State{}, ErrRejected
+	}
 	return state, nil
 }
 
 func (s *Store) save(state State) error {
-	if err := validateState(state); err != nil || state.RepoRootIdentity != s.repoIdentity {
+	if err := validateState(state); err != nil || state.RepoRootIdentity != s.repoIdentity || state.RepoFSIdentity != s.repoFSID {
 		return ErrRejected
 	}
 	repoStateDir := filepath.Join(s.stateRoot, s.repoIdentity)
@@ -307,6 +342,9 @@ func (s *Store) taskPath(taskID string) string {
 
 func validateState(state State) error {
 	if state.Version != stateVersion || !taskIDRE.MatchString(state.TaskID) || !identityRE.MatchString(state.RepoRootIdentity) {
+		return ErrRejected
+	}
+	if !identityRE.MatchString(state.RepoFSIdentity) {
 		return ErrRejected
 	}
 	if !validBranch(state.Branch) || !shaRE.MatchString(state.BaseSHA) || !shaRE.MatchString(state.CurrentHeadSHA) {
@@ -403,10 +441,36 @@ func pathWithin(parent, candidate string) bool {
 
 type gitInspector struct {
 	executable string
+	repoFSID   string
+}
+
+func filesystemIdentityAtPath(path string) (string, error) {
+	if path == "" || !filepath.IsAbs(path) {
+		return "", ErrRejected
+	}
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return "", ErrRejected
+	}
+	defer unix.Close(fd)
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return "", ErrRejected
+	}
+	digest := sha256.Sum256([]byte(fmt.Sprintf("%d:%d", uint64(stat.Dev), uint64(stat.Ino))))
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func pathMatchesFilesystemIdentity(path, expected string) bool {
+	if !identityRE.MatchString(expected) {
+		return false
+	}
+	identity, err := filesystemIdentityAtPath(path)
+	return err == nil && identity == expected
 }
 
 func (g gitInspector) Snapshot(ctx context.Context, repoRoot string) (RepositoryState, error) {
-	if ctx == nil || g.executable == "" || !filepath.IsAbs(g.executable) {
+	if ctx == nil || g.executable == "" || !filepath.IsAbs(g.executable) || !pathMatchesFilesystemIdentity(repoRoot, g.repoFSID) {
 		return RepositoryState{}, ErrRejected
 	}
 	ctx, cancel := context.WithTimeout(ctx, gitTimeout)
@@ -417,11 +481,11 @@ func (g gitInspector) Snapshot(ctx context.Context, repoRoot string) (Repository
 		return RepositoryState{}, ErrRejected
 	}
 	canonicalTop, err := filepath.EvalSymlinks(top)
-	if err != nil || filepath.Clean(canonicalTop) != filepath.Clean(repoRoot) {
+	if err != nil || filepath.Clean(canonicalTop) != filepath.Clean(repoRoot) || !pathMatchesFilesystemIdentity(repoRoot, g.repoFSID) {
 		return RepositoryState{}, ErrRejected
 	}
 	branch, err := runGit(ctx, g.executable, repoRoot, "symbolic-ref", "--quiet", "--short", "HEAD")
-	if err != nil || !validBranch(branch) {
+	if err != nil || !validBranch(branch) || !pathMatchesFilesystemIdentity(repoRoot, g.repoFSID) {
 		return RepositoryState{}, ErrRejected
 	}
 	head, err := runGit(ctx, g.executable, repoRoot, "rev-parse", "--verify", "HEAD^{commit}")
@@ -429,7 +493,7 @@ func (g gitInspector) Snapshot(ctx context.Context, repoRoot string) (Repository
 		return RepositoryState{}, ErrRejected
 	}
 	head = strings.ToLower(head)
-	if !shaRE.MatchString(head) {
+	if !shaRE.MatchString(head) || !pathMatchesFilesystemIdentity(repoRoot, g.repoFSID) {
 		return RepositoryState{}, ErrRejected
 	}
 	return RepositoryState{Branch: branch, Head: head}, nil

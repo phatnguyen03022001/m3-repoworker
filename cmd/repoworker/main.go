@@ -7,10 +7,15 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"syscall"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/tienphat/m3-repoworker/internal/repo"
 	"github.com/tienphat/m3-repoworker/internal/taskstate"
+	"golang.org/x/sys/unix"
 )
 
 type StatusInput struct{}
@@ -38,6 +43,8 @@ type RepoSearchOutput struct {
 	Truncated bool         `json:"truncated"`
 }
 
+type RepoSnapshotInput struct{}
+
 type ApplyPatchInput struct {
 	Patch string `json:"patch" jsonschema:"strict single-file unified diff with a/ and b/ headers"`
 }
@@ -45,6 +52,44 @@ type ApplyPatchInput struct {
 type ApplyPatchOutput struct {
 	Path     string `json:"path"`
 	Modified bool   `json:"modified"`
+}
+
+type CreateFileInput struct {
+	Path    string `json:"path" jsonschema:"repository-relative path for a new UTF-8 text file"`
+	Content string `json:"content" jsonschema:"UTF-8 text content for the new file"`
+}
+
+type CreateFileOutput struct {
+	Path    string `json:"path"`
+	Created bool   `json:"created"`
+}
+
+type DeleteFileInput struct {
+	Path string `json:"path" jsonschema:"repository-relative existing UTF-8 text file to delete"`
+}
+
+type DeleteFileOutput struct {
+	Path    string `json:"path"`
+	Deleted bool   `json:"deleted"`
+}
+
+type RepoVerifyInput struct {
+	Check string `json:"check" jsonschema:"verification preset: fmt, test, test-race, vet, mcp-integration, or verify"`
+}
+
+type RepoVerifyOutput struct {
+	Check    string `json:"check"`
+	Passed   bool   `json:"passed"`
+	ExitCode int    `json:"exit_code"`
+	TimedOut bool   `json:"timed_out"`
+}
+
+type GoModTidyInput struct{}
+
+type GoModTidyOutput struct {
+	Completed bool `json:"completed"`
+	ExitCode  int  `json:"exit_code"`
+	TimedOut  bool `json:"timed_out"`
 }
 
 type TaskCreateInput struct {
@@ -55,33 +100,138 @@ type TaskLookupInput struct {
 	TaskID string `json:"task_id" jsonschema:"RepoWorker-generated task identifier"`
 }
 
-type taskManager interface {
-	Create(context.Context, string) (taskstate.State, error)
-	Status(context.Context, string) (taskstate.State, error)
-	Resume(context.Context, string) (taskstate.State, error)
-}
-
 var errRequestRejected = errors.New("request rejected")
 
 func boolPtr(v bool) *bool { return &v }
 
-func newServer(repoRoot, stateRoot string) (*mcp.Server, error) {
-	workspace, err := repo.New(repoRoot)
-	if err != nil {
-		return nil, errRequestRejected
-	}
-	tasks, err := taskstate.New(repoRoot, stateRoot)
-	if err != nil {
-		return nil, errRequestRejected
-	}
-	return newServerForComponents(workspace, tasks), nil
+type fixedCommandOutcome struct {
+	exitCode int
+	timedOut bool
 }
 
-func newServerForComponents(workspace *repo.Workspace, tasks taskManager) *mcp.Server {
+func verificationPreset(check string) (string, time.Duration, bool) {
+	switch check {
+	case "fmt":
+		return "fmt-check", 2 * time.Minute, true
+	case "test":
+		return "test", 5 * time.Minute, true
+	case "test-race":
+		return "test-race", 10 * time.Minute, true
+	case "vet":
+		return "vet", 5 * time.Minute, true
+	case "mcp-integration":
+		return "mcp-integration", 5 * time.Minute, true
+	case "verify":
+		return "verify", 15 * time.Minute, true
+	default:
+		return "", 0, false
+	}
+}
+
+func resolveFixedExecutable(name string) (string, error) {
+	path, err := exec.LookPath(name)
+	if err != nil || !filepath.IsAbs(path) {
+		return "", errRequestRejected
+	}
+	path, err = filepath.EvalSymlinks(path)
+	if err != nil || !filepath.IsAbs(path) {
+		return "", errRequestRejected
+	}
+	return path, nil
+}
+
+func fixedExecutionEnv(network bool) []string {
+	env := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"LC_ALL=C",
+		"LANG=C",
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_OPTIONAL_LOCKS=0",
+		"GOCACHE=/dev/fd/3/.cache/go-build",
+		"GOMODCACHE=/dev/fd/3/.cache/go-mod",
+	}
+	if network {
+		env = append(env,
+			"GOPROXY=https://proxy.golang.org",
+			"GOSUMDB=sum.golang.org",
+			"GOPRIVATE=",
+			"GONOPROXY=none",
+			"GONOSUMDB=",
+		)
+	} else {
+		env = append(env, "GOPROXY=off")
+	}
+	return env
+}
+
+func runFixedCommand(ctx context.Context, root *os.File, executable string, args []string, env []string, timeout time.Duration) (fixedCommandOutcome, error) {
+	if ctx == nil || root == nil || executable == "" || timeout <= 0 {
+		return fixedCommandOutcome{}, errRequestRejected
+	}
+	path, err := resolveFixedExecutable(executable)
+	if err != nil {
+		return fixedCommandOutcome{}, errRequestRejected
+	}
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	command := exec.Command(path, args...)
+	command.ExtraFiles = []*os.File{root}
+	command.Env = env
+	command.Stdin = nil
+	command.Stdout = io.Discard
+	command.Stderr = io.Discard
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := command.Start(); err != nil {
+		return fixedCommandOutcome{}, errRequestRejected
+	}
+
+	wait := make(chan error, 1)
+	go func() {
+		wait <- command.Wait()
+	}()
+	select {
+	case err := <-wait:
+		if err == nil {
+			return fixedCommandOutcome{exitCode: 0}, nil
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return fixedCommandOutcome{exitCode: exitErr.ExitCode()}, nil
+		}
+		return fixedCommandOutcome{}, errRequestRejected
+	case <-runCtx.Done():
+		if command.Process != nil {
+			_ = unix.Kill(-command.Process.Pid, unix.SIGKILL)
+		}
+		<-wait
+		if ctx.Err() != nil {
+			return fixedCommandOutcome{}, errRequestRejected
+		}
+		return fixedCommandOutcome{exitCode: -1, timedOut: true}, nil
+	}
+}
+
+func newServer(repoRoot, stateRoot string) (*mcp.Server, *repo.Workspace, error) {
+	workspace, err := repo.New(repoRoot)
+	if err != nil {
+		return nil, nil, errRequestRejected
+	}
+	tasks, err := taskstate.New(workspace.StartupPath(), workspace.RootIdentity(), stateRoot)
+	if err != nil {
+		_ = workspace.Close()
+		return nil, nil, errRequestRejected
+	}
+	return newServerForComponents(workspace, tasks), workspace, nil
+}
+
+func newServerForComponents(workspace *repo.Workspace, tasks taskstate.StateStore) *mcp.Server {
 	server := mcp.NewServer(
 		&mcp.Implementation{
 			Name:    "m3-repoworker",
-			Version: "0.2.0",
+			Version: "0.3.0",
 		},
 		nil,
 	)
@@ -151,6 +301,28 @@ func newServerForComponents(workspace *repo.Workspace, tasks taskManager) *mcp.S
 	mcp.AddTool(
 		server,
 		&mcp.Tool{
+			Name:        "repo_snapshot",
+			Title:       "Snapshot repository",
+			Description: "Return a deterministic FD-relative manifest of permitted repository files.",
+			Annotations: &mcp.ToolAnnotations{
+				ReadOnlyHint:    true,
+				IdempotentHint:  true,
+				DestructiveHint: boolPtr(false),
+				OpenWorldHint:   boolPtr(false),
+			},
+		},
+		func(ctx context.Context, _ *mcp.CallToolRequest, _ RepoSnapshotInput) (*mcp.CallToolResult, repo.SnapshotManifest, error) {
+			manifest, err := workspace.Snapshot(ctx)
+			if err != nil {
+				return nil, repo.SnapshotManifest{}, safeToolError(err)
+			}
+			return nil, manifest, nil
+		},
+	)
+
+	mcp.AddTool(
+		server,
+		&mcp.Tool{
 			Name:        "apply_patch",
 			Title:       "Apply repository patch",
 			Description: "Atomically apply one exact-context, single-file unified diff to a permitted repository text file.",
@@ -167,6 +339,117 @@ func newServerForComponents(workspace *repo.Workspace, tasks taskManager) *mcp.S
 				return nil, ApplyPatchOutput{}, safeToolError(err)
 			}
 			return nil, ApplyPatchOutput{Path: path, Modified: true}, nil
+		},
+	)
+
+	mcp.AddTool(
+		server,
+		&mcp.Tool{
+			Name:        "create_file",
+			Title:       "Create repository file",
+			Description: "Create one new permitted UTF-8 text file without overwriting an existing path.",
+			Annotations: &mcp.ToolAnnotations{
+				ReadOnlyHint:    false,
+				IdempotentHint:  false,
+				DestructiveHint: boolPtr(false),
+				OpenWorldHint:   boolPtr(false),
+			},
+		},
+		func(_ context.Context, _ *mcp.CallToolRequest, input CreateFileInput) (*mcp.CallToolResult, CreateFileOutput, error) {
+			path, err := workspace.CreateFile(input.Path, input.Content)
+			if err != nil {
+				return nil, CreateFileOutput{}, safeToolError(err)
+			}
+			return nil, CreateFileOutput{Path: path, Created: true}, nil
+		},
+	)
+
+	mcp.AddTool(
+		server,
+		&mcp.Tool{
+			Name:        "delete_file",
+			Title:       "Delete repository file",
+			Description: "Delete one existing permitted regular file without following symlinks.",
+			Annotations: &mcp.ToolAnnotations{
+				ReadOnlyHint:    false,
+				IdempotentHint:  false,
+				DestructiveHint: boolPtr(true),
+				OpenWorldHint:   boolPtr(false),
+			},
+		},
+		func(_ context.Context, _ *mcp.CallToolRequest, input DeleteFileInput) (*mcp.CallToolResult, DeleteFileOutput, error) {
+			path, err := workspace.DeleteFile(input.Path)
+			if err != nil {
+				return nil, DeleteFileOutput{}, safeToolError(err)
+			}
+			return nil, DeleteFileOutput{Path: path, Deleted: true}, nil
+		},
+	)
+
+	mcp.AddTool(
+		server,
+		&mcp.Tool{
+			Name:        "repo_verify",
+			Title:       "Verify repository",
+			Description: "Run one hard-coded repository verification preset with bounded execution.",
+			Annotations: &mcp.ToolAnnotations{
+				ReadOnlyHint:    false,
+				IdempotentHint:  true,
+				DestructiveHint: boolPtr(true),
+				OpenWorldHint:   boolPtr(false),
+			},
+		},
+		func(ctx context.Context, _ *mcp.CallToolRequest, input RepoVerifyInput) (*mcp.CallToolResult, RepoVerifyOutput, error) {
+			target, timeout, ok := verificationPreset(input.Check)
+			if !ok {
+				return nil, RepoVerifyOutput{}, errRequestRejected
+			}
+			root, err := workspace.DuplicateRoot()
+			if err != nil {
+				return nil, RepoVerifyOutput{}, safeToolError(err)
+			}
+			defer root.Close()
+			outcome, err := runFixedCommand(ctx, root, "make", []string{"-C", "/dev/fd/3", target}, fixedExecutionEnv(false), timeout)
+			if err != nil {
+				return nil, RepoVerifyOutput{}, safeToolError(err)
+			}
+			return nil, RepoVerifyOutput{
+				Check: input.Check, Passed: outcome.exitCode == 0 && !outcome.timedOut,
+				ExitCode: outcome.exitCode, TimedOut: outcome.timedOut,
+			}, nil
+		},
+	)
+
+	mcp.AddTool(
+		server,
+		&mcp.Tool{
+			Name:        "repo_go_mod_tidy",
+			Title:       "Tidy Go modules",
+			Description: "Run fixed go mod tidy against the opened repository root with registry-only module network access.",
+			Annotations: &mcp.ToolAnnotations{
+				ReadOnlyHint:    false,
+				IdempotentHint:  true,
+				DestructiveHint: boolPtr(true),
+				OpenWorldHint:   boolPtr(true),
+			},
+		},
+		func(ctx context.Context, _ *mcp.CallToolRequest, _ GoModTidyInput) (*mcp.CallToolResult, GoModTidyOutput, error) {
+			root, err := workspace.DuplicateRoot()
+			if err != nil {
+				return nil, GoModTidyOutput{}, safeToolError(err)
+			}
+			defer root.Close()
+			outcome, err := runFixedCommand(
+				ctx, root, "go", []string{"-C", "/dev/fd/3", "mod", "tidy"},
+				fixedExecutionEnv(true), 10*time.Minute,
+			)
+			if err != nil {
+				return nil, GoModTidyOutput{}, safeToolError(err)
+			}
+			return nil, GoModTidyOutput{
+				Completed: outcome.exitCode == 0 && !outcome.timedOut,
+				ExitCode:  outcome.exitCode, TimedOut: outcome.timedOut,
+			}, nil
 		},
 	)
 
@@ -265,10 +548,13 @@ func main() {
 }
 
 func run(ctx context.Context, transport mcp.Transport, repoRoot, stateRoot string) error {
-	server, err := newServer(repoRoot, stateRoot)
+	server, workspace, err := newServer(repoRoot, stateRoot)
 	if err != nil {
 		return errRequestRejected
 	}
+	defer func() {
+		_ = workspace.Close()
+	}()
 	err = server.Run(ctx, transport)
 	if errors.Is(err, io.EOF) {
 		return nil

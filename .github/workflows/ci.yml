@@ -1,0 +1,32 @@
+name: M3 CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Verify core
+        run: |
+          make fmt-check
+          make vet
+          make test
+          make test-race
+          make mcp-integration
+          make mod-verify
+          make build

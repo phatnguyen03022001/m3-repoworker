@@ -8,6 +8,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestNewRequiresAbsoluteDirectory(t *testing.T) {
@@ -25,6 +28,30 @@ func TestNewRequiresAbsoluteDirectory(t *testing.T) {
 	}
 	if _, err := New(gitDirectory); !errors.Is(err, ErrConfig) {
 		t.Fatalf("New(.git) error = %v, want ErrConfig", err)
+	}
+}
+
+func TestCapabilityFDsAreCloseOnExec(t *testing.T) {
+	root, _ := testWorkspace(t)
+	workspace, err := New(root)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer workspace.Close()
+	writeTestFile(t, filepath.Join(root, "file.txt"), "ok\n")
+	file, _, err := workspace.openExistingRelative("file.txt", false)
+	if err != nil {
+		t.Fatalf("openExistingRelative() error = %v", err)
+	}
+	defer file.Close()
+	for _, fd := range []uintptr{workspace.rootDir.Fd(), file.Fd()} {
+		flags, err := unix.FcntlInt(fd, unix.F_GETFD, 0)
+		if err != nil {
+			t.Fatalf("F_GETFD error = %v", err)
+		}
+		if flags&unix.FD_CLOEXEC == 0 {
+			t.Fatalf("fd %d missing FD_CLOEXEC", fd)
+		}
 	}
 }
 
@@ -71,6 +98,105 @@ func TestReadConfinesAccessAndProtectsSecrets(t *testing.T) {
 				t.Fatalf("Read(%q) error = %v, want ErrRejected", path, err)
 			}
 		})
+	}
+}
+
+func TestReadRejectsFIFOWithoutBlocking(t *testing.T) {
+	root, _ := testWorkspace(t)
+	workspace, err := New(root)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer workspace.Close()
+	fifo := filepath.Join(root, "pipe")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatalf("Mkfifo() error = %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := workspace.Read("pipe")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrRejected) {
+			t.Fatalf("Read(FIFO) error = %v, want ErrRejected", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Read(FIFO) blocked")
+	}
+}
+
+func TestReadRemainsBoundToOpenedRootAfterRename(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "repo")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	writeTestFile(t, filepath.Join(root, "identity.txt"), "original\n")
+	workspace, err := New(root)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	identity := workspace.RootIdentity()
+
+	moved := filepath.Join(parent, "repo-moved")
+	if err := os.Rename(root, moved); err != nil {
+		t.Fatalf("rename repo: %v", err)
+	}
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatalf("recreate old path: %v", err)
+	}
+	writeTestFile(t, filepath.Join(root, "identity.txt"), "replacement\n")
+
+	_, content, err := workspace.Read("identity.txt")
+	if err != nil {
+		t.Fatalf("Read() after rename error = %v", err)
+	}
+	if content != "original\n" {
+		t.Fatalf("Read() after rename = %q, want original root content", content)
+	}
+	if workspace.RootIdentity() != identity {
+		t.Fatalf("root identity changed after rename")
+	}
+}
+
+func TestPathBasedOperationsRejectReplacementRoot(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "repo")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	writeTestFile(t, filepath.Join(root, "target.txt"), "original\n")
+	workspace, err := New(root)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	moved := filepath.Join(parent, "repo-moved")
+	if err := os.Rename(root, moved); err != nil {
+		t.Fatalf("rename repo: %v", err)
+	}
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatalf("recreate old path: %v", err)
+	}
+	replacement := filepath.Join(root, "target.txt")
+	writeTestFile(t, replacement, "replacement\n")
+	result, err := workspace.Search(context.Background(), "original", "")
+	if err != nil {
+		t.Fatalf("Search() after root replacement error = %v", err)
+	}
+	if len(result.Matches) != 1 || result.Matches[0].Path != "target.txt" {
+		t.Fatalf("Search() after root replacement = %#v, want original repo match", result)
+	}
+	patch := "--- a/target.txt\n+++ b/target.txt\n@@ -1 +1 @@\n-original\n+changed\n"
+	if _, err := workspace.ApplyPatch(patch); err != nil {
+		t.Fatalf("ApplyPatch() after root replacement error = %v", err)
+	}
+	if got := readTestFile(t, replacement); got != "replacement\n" {
+		t.Fatalf("replacement repo modified: %q", got)
+	}
+	if got := readTestFile(t, filepath.Join(moved, "target.txt")); got != "changed\n" {
+		t.Fatalf("original repo not patched: %q", got)
 	}
 }
 
@@ -173,6 +299,139 @@ func TestSearchBoundsLongMatchText(t *testing.T) {
 	match := result.Matches[0]
 	if !match.Truncated || len(match.Text) > maxMatchTextBytes || !strings.Contains(match.Text, "needle") {
 		t.Fatalf("long match = %#v, want bounded preview containing query", match)
+	}
+}
+
+func TestSnapshotManifestIsDeterministicAndOmitsProtectedPaths(t *testing.T) {
+	root, _ := testWorkspace(t)
+	workspace, err := New(root)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer workspace.Close()
+	writeTestFile(t, filepath.Join(root, "src", "main.go"), "package main\n")
+	writeTestFile(t, filepath.Join(root, ".env"), "hidden\n")
+
+	first, err := workspace.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	second, err := workspace.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot() second error = %v", err)
+	}
+	if first.SnapshotID == "" || first.SnapshotID != second.SnapshotID {
+		t.Fatalf("snapshot ids = %q / %q, want stable non-empty id", first.SnapshotID, second.SnapshotID)
+	}
+	entries := make(map[string]SnapshotEntry, len(first.Entries))
+	for _, entry := range first.Entries {
+		entries[entry.Path] = entry
+	}
+	if _, ok := entries[".env"]; ok {
+		t.Fatal("protected .env unexpectedly present in snapshot")
+	}
+	if entry, ok := entries["src"]; !ok || entry.Type != "directory" {
+		t.Fatalf("src entry = %#v, want directory", entry)
+	}
+	if entry, ok := entries["src/main.go"]; !ok || entry.Type != "regular" || len(entry.Digest) != 64 || entry.Size == 0 {
+		t.Fatalf("src/main.go entry = %#v, want hashed regular file", entry)
+	}
+
+	writeTestFile(t, filepath.Join(root, "src", "main.go"), "package changed\n")
+	third, err := workspace.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot() after change error = %v", err)
+	}
+	if third.SnapshotID == first.SnapshotID {
+		t.Fatal("snapshot id did not change after file content changed")
+	}
+}
+
+func TestSnapshotRejectsSymlink(t *testing.T) {
+	root, outside := testWorkspace(t)
+	workspace, err := New(root)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer workspace.Close()
+	writeTestFile(t, filepath.Join(outside, "outside.txt"), "outside\n")
+	if err := os.Symlink(filepath.Join(outside, "outside.txt"), filepath.Join(root, "escape")); err != nil {
+		t.Fatalf("Symlink() error = %v", err)
+	}
+	if _, err := workspace.Snapshot(context.Background()); !errors.Is(err, ErrRejected) {
+		t.Fatalf("Snapshot(symlink) error = %v, want ErrRejected", err)
+	}
+}
+
+func TestCreateFileIsNoOverwriteAndIdentityBound(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "repo")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	workspace, err := New(root)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer workspace.Close()
+
+	moved := filepath.Join(parent, "repo-moved")
+	if err := os.Rename(root, moved); err != nil {
+		t.Fatalf("rename repo: %v", err)
+	}
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatalf("recreate old path: %v", err)
+	}
+	path, err := workspace.CreateFile("new.txt", "created\n")
+	if err != nil || path != "new.txt" {
+		t.Fatalf("CreateFile() = (%q, %v), want new.txt", path, err)
+	}
+	if got := readTestFile(t, filepath.Join(moved, "new.txt")); got != "created\n" {
+		t.Fatalf("created file in original repo = %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(root, "new.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement repo unexpectedly received new.txt: %v", err)
+	}
+	if _, err := workspace.CreateFile("new.txt", "overwrite\n"); !errors.Is(err, ErrRejected) {
+		t.Fatalf("CreateFile(existing) error = %v, want ErrRejected", err)
+	}
+	if got := readTestFile(t, filepath.Join(moved, "new.txt")); got != "created\n" {
+		t.Fatalf("existing file overwritten: %q", got)
+	}
+	if _, err := workspace.CreateFile(".env", "hidden\n"); !errors.Is(err, ErrRejected) {
+		t.Fatalf("CreateFile(.env) error = %v, want ErrRejected", err)
+	}
+}
+
+func TestDeleteFileConfinesAndProtectsTargets(t *testing.T) {
+	root, outside := testWorkspace(t)
+	workspace, err := New(root)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer workspace.Close()
+
+	writeTestFile(t, filepath.Join(root, "delete.txt"), "remove\n")
+	writeTestFile(t, filepath.Join(root, ".env"), "protected\n")
+	writeTestFile(t, filepath.Join(outside, "outside.txt"), "outside\n")
+	if err := os.Symlink(filepath.Join(outside, "outside.txt"), filepath.Join(root, "outside-link")); err != nil {
+		t.Fatalf("Symlink() error = %v", err)
+	}
+
+	path, err := workspace.DeleteFile("delete.txt")
+	if err != nil || path != "delete.txt" {
+		t.Fatalf("DeleteFile() = (%q, %v), want delete.txt", path, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "delete.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deleted file still exists: %v", err)
+	}
+	for _, path := range []string{".env", "outside-link", "../outside.txt"} {
+		if _, err := workspace.DeleteFile(path); !errors.Is(err, ErrRejected) {
+			t.Fatalf("DeleteFile(%q) error = %v, want ErrRejected", path, err)
+		}
+	}
+	if got := readTestFile(t, filepath.Join(outside, "outside.txt")); got != "outside\n" {
+		t.Fatalf("outside file changed: %q", got)
 	}
 }
 

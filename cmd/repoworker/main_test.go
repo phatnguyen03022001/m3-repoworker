@@ -42,15 +42,15 @@ func TestRepoStatusTool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list tools: %v", err)
 	}
-	if len(tools.Tools) != 7 {
-		t.Fatalf("tool count = %d, want 7", len(tools.Tools))
+	if len(tools.Tools) != 12 {
+		t.Fatalf("tool count = %d, want 12", len(tools.Tools))
 	}
 
 	toolByName := make(map[string]*mcp.Tool)
 	for _, tool := range tools.Tools {
 		toolByName[tool.Name] = tool
 	}
-	for _, name := range []string{"repo_status", "repo_read", "repo_search", "task_status"} {
+	for _, name := range []string{"repo_status", "repo_read", "repo_search", "repo_snapshot", "task_status"} {
 		tool := toolByName[name]
 		if tool == nil || tool.Annotations == nil || !tool.Annotations.ReadOnlyHint || !tool.Annotations.IdempotentHint || tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint || tool.Annotations.OpenWorldHint == nil || *tool.Annotations.OpenWorldHint {
 			t.Errorf("%s annotations = %#v, want read-only, idempotent, closed-world, and non-destructive", name, tool)
@@ -59,6 +59,22 @@ func TestRepoStatusTool(t *testing.T) {
 	patchTool := toolByName["apply_patch"]
 	if patchTool == nil || patchTool.Annotations == nil || patchTool.Annotations.ReadOnlyHint || patchTool.Annotations.IdempotentHint || patchTool.Annotations.DestructiveHint == nil || !*patchTool.Annotations.DestructiveHint || patchTool.Annotations.OpenWorldHint == nil || *patchTool.Annotations.OpenWorldHint {
 		t.Errorf("apply_patch annotations = %#v, want mutating, non-idempotent, closed-world, and destructive", patchTool)
+	}
+	fileCreateTool := toolByName["create_file"]
+	if fileCreateTool == nil || fileCreateTool.Annotations == nil || fileCreateTool.Annotations.ReadOnlyHint || fileCreateTool.Annotations.IdempotentHint || fileCreateTool.Annotations.DestructiveHint == nil || *fileCreateTool.Annotations.DestructiveHint || fileCreateTool.Annotations.OpenWorldHint == nil || *fileCreateTool.Annotations.OpenWorldHint {
+		t.Errorf("create_file annotations = %#v, want mutating, non-idempotent, non-destructive, closed-world", fileCreateTool)
+	}
+	deleteTool := toolByName["delete_file"]
+	if deleteTool == nil || deleteTool.Annotations == nil || deleteTool.Annotations.ReadOnlyHint || deleteTool.Annotations.IdempotentHint || deleteTool.Annotations.DestructiveHint == nil || !*deleteTool.Annotations.DestructiveHint || deleteTool.Annotations.OpenWorldHint == nil || *deleteTool.Annotations.OpenWorldHint {
+		t.Errorf("delete_file annotations = %#v, want mutating, non-idempotent, destructive, closed-world", deleteTool)
+	}
+	verifyTool := toolByName["repo_verify"]
+	if verifyTool == nil || verifyTool.Annotations == nil || verifyTool.Annotations.ReadOnlyHint || !verifyTool.Annotations.IdempotentHint || verifyTool.Annotations.DestructiveHint == nil || !*verifyTool.Annotations.DestructiveHint || verifyTool.Annotations.OpenWorldHint == nil || *verifyTool.Annotations.OpenWorldHint {
+		t.Errorf("repo_verify annotations = %#v, want mutating, idempotent, destructive, closed-world", verifyTool)
+	}
+	tidyTool := toolByName["repo_go_mod_tidy"]
+	if tidyTool == nil || tidyTool.Annotations == nil || tidyTool.Annotations.ReadOnlyHint || !tidyTool.Annotations.IdempotentHint || tidyTool.Annotations.DestructiveHint == nil || !*tidyTool.Annotations.DestructiveHint || tidyTool.Annotations.OpenWorldHint == nil || !*tidyTool.Annotations.OpenWorldHint {
+		t.Errorf("repo_go_mod_tidy annotations = %#v, want mutating, idempotent, destructive, open-world", tidyTool)
 	}
 	createTool := toolByName["task_create"]
 	if createTool == nil || createTool.Annotations == nil || createTool.Annotations.ReadOnlyHint || createTool.Annotations.IdempotentHint || createTool.Annotations.DestructiveHint == nil || *createTool.Annotations.DestructiveHint || createTool.Annotations.OpenWorldHint == nil || *createTool.Annotations.OpenWorldHint {
@@ -125,6 +141,36 @@ func TestMCPRepositoryToolsAndSanitizedRejection(t *testing.T) {
 		t.Fatalf("repo_search matches = %#v, want one match", searchOutput["matches"])
 	}
 
+	snapshotResult, err := client.CallTool(ctx, &mcp.CallToolParams{Name: "repo_snapshot"})
+	if err != nil || snapshotResult.IsError {
+		t.Fatalf("repo_snapshot result = %#v, error = %v", snapshotResult, err)
+	}
+	snapshotOutput := structuredMap(t, snapshotResult)
+	if snapshotID, ok := snapshotOutput["snapshot_id"].(string); !ok || len(snapshotID) != 64 {
+		t.Fatalf("repo_snapshot id = %#v, want 64 hex chars", snapshotOutput["snapshot_id"])
+	}
+
+	createResult, err := client.CallTool(ctx, &mcp.CallToolParams{Name: "create_file", Arguments: map[string]any{"path": "src/new.go", "content": "package main\n"}})
+	if err != nil || createResult.IsError {
+		t.Fatalf("create_file result = %#v, error = %v", createResult, err)
+	}
+	createOutput := structuredMap(t, createResult)
+	if createOutput["path"] != "src/new.go" || createOutput["created"] != true {
+		t.Fatalf("create_file output = %#v", createOutput)
+	}
+
+	deleteResult, err := client.CallTool(ctx, &mcp.CallToolParams{Name: "delete_file", Arguments: map[string]any{"path": "src/new.go"}})
+	if err != nil || deleteResult.IsError {
+		t.Fatalf("delete_file result = %#v, error = %v", deleteResult, err)
+	}
+	deleteOutput := structuredMap(t, deleteResult)
+	if deleteOutput["path"] != "src/new.go" || deleteOutput["deleted"] != true {
+		t.Fatalf("delete_file output = %#v", deleteOutput)
+	}
+	if _, err := os.Stat(filepath.Join(root, "src", "new.go")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("delete_file left target present: %v", err)
+	}
+
 	patch := "--- a/src/main.go\n+++ b/src/main.go\n@@ -1,2 +1,2 @@\n package main\n-old value\n+new value\n"
 	patchResult, err := client.CallTool(ctx, &mcp.CallToolParams{Name: "apply_patch", Arguments: map[string]any{"patch": patch}})
 	if err != nil || patchResult.IsError {
@@ -149,6 +195,9 @@ func TestMCPRepositoryToolsAndSanitizedRejection(t *testing.T) {
 	}{
 		{name: "repo_read", arguments: map[string]any{"path": ".env"}},
 		{name: "repo_search", arguments: map[string]any{"query": "value", "path": "../outside"}},
+		{name: "create_file", arguments: map[string]any{"path": ".env", "content": "hidden\n"}},
+		{name: "delete_file", arguments: map[string]any{"path": ".env"}},
+		{name: "repo_verify", arguments: map[string]any{"check": "shell"}},
 		{name: "apply_patch", arguments: map[string]any{"patch": "--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n-old\n+new\n"}},
 	} {
 		rejected, err := client.CallTool(ctx, &mcp.CallToolParams{Name: request.name, Arguments: request.arguments})
@@ -200,6 +249,35 @@ func TestMCPTaskToolsAndSanitizedRejection(t *testing.T) {
 	assertSanitizedToolError(t, "task_status", rejected, "/Users/example")
 }
 
+func TestVerificationPresetAndEnvironmentAreFixed(t *testing.T) {
+	cases := map[string]string{
+		"fmt":             "fmt-check",
+		"test":            "test",
+		"test-race":       "test-race",
+		"vet":             "vet",
+		"mcp-integration": "mcp-integration",
+		"verify":          "verify",
+	}
+	for check, wantTarget := range cases {
+		target, timeout, ok := verificationPreset(check)
+		if !ok || target != wantTarget || timeout <= 0 {
+			t.Fatalf("verificationPreset(%q) = (%q, %v, %v)", check, target, timeout, ok)
+		}
+	}
+	if _, _, ok := verificationPreset("shell"); ok {
+		t.Fatal("verificationPreset(shell) unexpectedly accepted arbitrary command")
+	}
+
+	offline := strings.Join(fixedExecutionEnv(false), "\n")
+	if !strings.Contains(offline, "GOPROXY=off") || strings.Contains(offline, "GITHUB_TOKEN=") || strings.Contains(offline, "SSH_AUTH_SOCK=") {
+		t.Fatalf("offline execution environment is not confined: %q", offline)
+	}
+	maintenance := strings.Join(fixedExecutionEnv(true), "\n")
+	if !strings.Contains(maintenance, "GOPROXY=https://proxy.golang.org") || strings.Contains(maintenance, "GOPRIVATE="+os.Getenv("GOPRIVATE")) && os.Getenv("GOPRIVATE") != "" {
+		t.Fatalf("maintenance execution environment is not fixed: %q", maintenance)
+	}
+}
+
 type nopWriteCloser struct {
 	io.Writer
 }
@@ -228,7 +306,7 @@ func (f *fakeTaskManager) Resume(_ context.Context, taskID string) (taskstate.St
 	return f.state, f.err
 }
 
-func connectClient(t *testing.T, root string, tasks taskManager) *mcp.ClientSession {
+func connectClient(t *testing.T, root string, tasks taskstate.StateStore) *mcp.ClientSession {
 	t.Helper()
 	ctx := context.Background()
 	workspace, err := repo.New(root)
