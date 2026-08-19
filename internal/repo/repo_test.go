@@ -1,10 +1,12 @@
 package repo
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -34,6 +36,7 @@ func TestReadConfinesAccessAndProtectsSecrets(t *testing.T) {
 	}
 
 	writeTestFile(t, filepath.Join(root, "src", "main.go"), "package main\n// needle\n")
+	writeTestFile(t, filepath.Join(root, "src", "token.go"), "package auth\n")
 	writeTestFile(t, filepath.Join(root, ".env"), "DATABASE_PASSWORD=not-for-output\n")
 	writeTestFile(t, filepath.Join(root, ".env.local"), "API_KEY=not-for-output\n")
 	writeTestFile(t, filepath.Join(root, "credentials.json"), "not-for-output\n")
@@ -53,6 +56,9 @@ func TestReadConfinesAccessAndProtectsSecrets(t *testing.T) {
 	}
 	if path != "src/main.go" || content != "package main\n// needle\n" {
 		t.Fatalf("Read() = (%q, %q), want safe source file", path, content)
+	}
+	if _, content, err := workspace.Read("src/token.go"); err != nil || content != "package auth\n" {
+		t.Fatalf("Read(token.go) = (%q, %v), want source file to remain accessible", content, err)
 	}
 
 	for _, path := range []string{
@@ -84,7 +90,7 @@ func TestSearchSkipsProtectedAndSymlinkedFiles(t *testing.T) {
 		t.Fatalf("create directory symlink: %v", err)
 	}
 
-	result, err := workspace.Search("needle", "")
+	result, err := workspace.Search(context.Background(), "needle", "")
 	if err != nil {
 		t.Fatalf("Search() error = %v", err)
 	}
@@ -97,7 +103,7 @@ func TestSearchSkipsProtectedAndSymlinkedFiles(t *testing.T) {
 
 	for _, scope := range []string{"/etc", "../", "src/../", ".git", ".env", "linked-outside"} {
 		t.Run(scope, func(t *testing.T) {
-			_, err := workspace.Search("needle", scope)
+			_, err := workspace.Search(context.Background(), "needle", scope)
 			if !errors.Is(err, ErrRejected) {
 				t.Fatalf("Search(%q) error = %v, want ErrRejected", scope, err)
 			}
@@ -113,12 +119,60 @@ func TestSearchIsBounded(t *testing.T) {
 	}
 
 	writeTestFile(t, filepath.Join(root, "matches.txt"), strings.Repeat("needle\n", maxMatches+1))
-	result, err := workspace.Search("needle", "")
+	result, err := workspace.Search(context.Background(), "needle", "")
 	if err != nil {
 		t.Fatalf("Search() error = %v", err)
 	}
 	if len(result.Matches) != maxMatches || !result.Truncated {
 		t.Errorf("Search() = %#v, want %d truncated matches", result, maxMatches)
+	}
+}
+
+func TestSearchEnforcesRepositoryBudgetsAndCancellation(t *testing.T) {
+	root, _ := testWorkspace(t)
+	workspace, err := New(root)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	workspace.maxSearchFiles = 1
+	workspace.maxSearchBytes = maxFileBytes
+	writeTestFile(t, filepath.Join(root, "a.txt"), "needle a\n")
+	writeTestFile(t, filepath.Join(root, "b.txt"), "needle b\n")
+
+	result, err := workspace.Search(context.Background(), "needle", "")
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(result.Matches) != 1 || !result.Truncated {
+		t.Fatalf("Search() = %#v, want one match and truncation at file budget", result)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := workspace.Search(ctx, "needle", ""); !errors.Is(err, ErrRejected) {
+		t.Fatalf("Search(cancelled) error = %v, want ErrRejected", err)
+	}
+}
+
+func TestSearchBoundsLongMatchText(t *testing.T) {
+	root, _ := testWorkspace(t)
+	workspace, err := New(root)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	line := strings.Repeat("a", maxMatchTextBytes) + "needle" + strings.Repeat("b", maxMatchTextBytes)
+	writeTestFile(t, filepath.Join(root, "long.txt"), line+"\n")
+
+	result, err := workspace.Search(context.Background(), "needle", "")
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(result.Matches) != 1 {
+		t.Fatalf("Search() matches = %#v, want one match", result.Matches)
+	}
+	match := result.Matches[0]
+	if !match.Truncated || len(match.Text) > maxMatchTextBytes || !strings.Contains(match.Text, "needle") {
+		t.Fatalf("long match = %#v, want bounded preview containing query", match)
 	}
 }
 
@@ -171,6 +225,73 @@ func TestApplyPatchUsesExactContextAndRejectsUnsafeTargets(t *testing.T) {
 	}
 	if got := readTestFile(t, linkTarget); got != "old\n" {
 		t.Errorf("symlink target changed: %q", got)
+	}
+}
+
+func TestApplyPatchHandlesLaterAndMultipleHunks(t *testing.T) {
+	root, _ := testWorkspace(t)
+	workspace, err := New(root)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	target := filepath.Join(root, "multi.txt")
+	writeTestFile(t, target, "line1\nline2\nline3\nline4\nline5\nline6\n")
+	patch := "--- a/multi.txt\n+++ b/multi.txt\n@@ -2,2 +2,2 @@\n line2\n-line3\n+LINE3\n@@ -5,2 +5,2 @@\n line5\n-line6\n+LINE6\n"
+
+	if _, err := workspace.ApplyPatch(patch); err != nil {
+		t.Fatalf("ApplyPatch(multi-hunk) error = %v", err)
+	}
+	if got, want := readTestFile(t, target), "line1\nline2\nLINE3\nline4\nline5\nLINE6\n"; got != want {
+		t.Fatalf("patched file = %q, want %q", got, want)
+	}
+}
+
+func TestApplyPatchSerializesConcurrentStalePatches(t *testing.T) {
+	root, _ := testWorkspace(t)
+	workspace, err := New(root)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	target := filepath.Join(root, "concurrent.txt")
+	writeTestFile(t, target, "header\nold\nfooter\n")
+	patchA := "--- a/concurrent.txt\n+++ b/concurrent.txt\n@@ -1,3 +1,3 @@\n header\n-old\n+A\n footer\n"
+	patchB := "--- a/concurrent.txt\n+++ b/concurrent.txt\n@@ -1,3 +1,3 @@\n header\n-old\n+B\n footer\n"
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	for _, patch := range []string{patchA, patchB} {
+		patch := patch
+		go func() {
+			ready.Done()
+			<-start
+			_, err := workspace.ApplyPatch(patch)
+			results <- err
+		}()
+	}
+	ready.Wait()
+	close(start)
+
+	successes := 0
+	rejections := 0
+	for range 2 {
+		err := <-results
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrRejected):
+			rejections++
+		default:
+			t.Fatalf("unexpected patch error: %v", err)
+		}
+	}
+	if successes != 1 || rejections != 1 {
+		t.Fatalf("concurrent patches: successes=%d rejections=%d, want 1/1", successes, rejections)
+	}
+	got := readTestFile(t, target)
+	if got != "header\nA\nfooter\n" && got != "header\nB\nfooter\n" {
+		t.Fatalf("concurrent patched file = %q", got)
 	}
 }
 

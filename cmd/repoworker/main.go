@@ -120,8 +120,8 @@ func newServerForWorkspace(workspace *repo.Workspace) *mcp.Server {
 				OpenWorldHint:   boolPtr(false),
 			},
 		},
-		func(_ context.Context, _ *mcp.CallToolRequest, input RepoSearchInput) (*mcp.CallToolResult, RepoSearchOutput, error) {
-			result, err := workspace.Search(input.Query, input.Path)
+		func(ctx context.Context, _ *mcp.CallToolRequest, input RepoSearchInput) (*mcp.CallToolResult, RepoSearchOutput, error) {
+			result, err := workspace.Search(ctx, input.Query, input.Path)
 			if err != nil {
 				return nil, RepoSearchOutput{}, safeToolError(err)
 			}
