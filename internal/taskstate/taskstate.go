@@ -21,18 +21,18 @@ import (
 )
 
 const (
-	stateVersion        = 1
-	maxStateBytes int64 = 64 << 10
-	maxNextActionBytes  = 4 << 10
-	maxBranchBytes      = 256
-	gitTimeout          = 3 * time.Second
+	stateVersion             = 1
+	maxStateBytes      int64 = 64 << 10
+	maxNextActionBytes       = 4 << 10
+	maxBranchBytes           = 256
+	gitTimeout               = 3 * time.Second
 )
 
 var (
 	ErrRejected = errors.New("task state request rejected")
-	taskIDRE     = regexp.MustCompile(`^task_[0-9a-f]{32}$`)
-	shaRE        = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
-	identityRE   = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	taskIDRE    = regexp.MustCompile(`^task_[0-9a-f]{32}$`)
+	shaRE       = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
+	identityRE  = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 // RepositoryState is the trusted local Git metadata bound to a task.
