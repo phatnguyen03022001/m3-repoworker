@@ -22,3 +22,8 @@ single-use session nonces, typed mount/network/execution compilation, and
 one-time confirmation tokens for destructive and publication classes. A live
 repository cannot be compiled as a runtime mount, full network is denied, and
 host shell executables are rejected. Audit detail is bounded and redacted.
+
+M3.3 keeps process output bounded and spills overflow to private files. Process
+groups are killed on cancellation/timeout, PTY is interactive-only, and
+environment variables with credential-bearing names are rejected before a
+starter is called.

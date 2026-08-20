@@ -37,3 +37,17 @@
   optional PTY.
 - Exact next action: define `ProcessSpec` and the supervised process contract,
   bind it to the M3.2 runtime policy, and add leak/race/timeout tests.
+
+## M3.3 — IN PROGRESS
+
+- State: typed supervised process layer implemented locally; verification and
+  checkpoint pending.
+- Scope: `ProcessSpec`, starter abstraction, monotonic stdout/stderr/PTY
+  cursors, bounded memory with durable spill, cancellation/timeout and
+  process-group cleanup, signals, environment rejection, and optional PTY.
+- Tests: process unit tests cover cursor resume, spill permissions, timeout,
+  cancellation, signal cleanup, PTY gating, and credential environment denial.
+- Decisions: see `docs/adr/0003-m3.3-supervised-processes.md`.
+- Remaining: run full verification and checkpoint on `main`.
+- Exact next action: run `make verify`, `govulncheck ./...`, inspect the diff,
+  and commit `m3.3: supervised process layer`.

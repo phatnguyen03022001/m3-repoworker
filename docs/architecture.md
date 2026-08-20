@@ -16,6 +16,8 @@ The current M3.1 substrate consists of:
 - `internal/security`: typed deny-by-default capabilities, enrollment,
   principal/session binding, replay protection, confirmation classes, runtime
   policy compilation, and redacted audit events.
+- `internal/process`: typed supervised processes, bounded cursor streams,
+  durable spill, cancellation/timeout cleanup, signals, and optional PTY.
 
 M3.2–M3.10 will bind authenticated principals, capabilities, process/runtime
 backends, resource admission, verification, events, autonomous-loop state,

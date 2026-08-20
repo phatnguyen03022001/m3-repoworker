@@ -3,6 +3,7 @@ module github.com/tienphat/m3-repoworker
 go 1.26.6
 
 require (
+	github.com/creack/pty v1.1.18
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	golang.org/x/sys v0.47.0
 	modernc.org/sqlite v1.57.0
