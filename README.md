@@ -114,11 +114,31 @@ publication_plan publication_execute
 operator binding; `repo_git_status` là read-only và trả repository identity,
 trusted root identity, branch, full HEAD SHA, dirty state, changed paths,
 `changed_count`, và `truncated` trong giới hạn cố định. Không có
-`confirmation_issue`, client shell, host execution, arbitrary file mutation,
+`confirmation_issue`, client-supplied host shell, host execution, arbitrary file mutation,
 branch switching, hay worktree creation. Confirmation được cấp qua
 operator-only authority riêng và không bao giờ qua autonomous MCP.
 Candidate edit chỉ xảy ra trong TaskWorkspace đã lease và qua autonomous loop
-bị giới hạn.
+bị giới hạn. `process_run` cũng nhận `sh`, `bash`, hoặc `zsh` khi image có shell,
+nhưng generic shell chỉ chạy bên trong Apple container tại `/workspace`:
+
+```json
+{"executable":"sh","arguments":["-lc","printf shell-ok && go test ./..."],"cwd":"/workspace"}
+```
+
+RepoWorker không expose unrestricted macOS host shell. Shell command có thể
+chạy các lệnh development repository-local như:
+
+```text
+Go:     go test ./..., go test -race ./..., go vet ./..., gofmt -l $(git ls-files '*.go'), make verify
+Node:   npm test, npm run lint, npm run build, npx eslint ., tsc --noEmit
+Python: python -m pytest, ruff check ., black --check ., mypy ., uv run pytest
+Rust:   cargo test, cargo fmt --check, cargo clippy
+Generic: make test, make lint, ./scripts/test.sh, ./scripts/lint.sh
+```
+
+Các tool phải có sẵn trong image hoặc candidate workspace. PATH deterministic
+bao gồm `node_modules/.bin`, `.venv/bin`, và `bin/`; host PATH, credentials,
+brew, sudo, host pip/npm-global và host filesystem không được kế thừa.
 
 Production operator approval dùng `<state-dir>/operator.sock` (`0600`) và
 `<state-dir>/operator.key` (`0600`) trong state directory (`0700`), qua lệnh
@@ -146,8 +166,10 @@ disabled.
 Checkout phải ở `main` khi khởi động; mọi mutation re-check trusted branch.
 State nằm ngoài checkout với quyền private. Path là relative, bounded,
 symlink-safe, không chạm `.git`, credential stores, hay state root. Apple
-runtime chỉ mount workspace cô lập, no-network mặc định, và chạy argv
-allow-list qua supervised process group.
+runtime chỉ mount workspace cô lập, no-network mặc định, và chạy typed
+executable qua supervised process group. Registry/full network hiện fail closed
+vì Apple adapter chưa có domain-filtered network primitive; không giả lập
+registry support bằng broad outbound network.
 
 Rejected MCP request trả về `request rejected`; credential không được ghi vào
 environment/event payload hoặc command arguments.

@@ -12,6 +12,10 @@ MCP adapter. It includes:
   operator-only confirmations, mount/network/executable policy, and audit;
 - bounded supervised processes, Apple container lifecycle, Lima validation,
   scheduler/resource admission, environment identities and private caches;
+- M3 development shell/general lint execution through `process_run`: `sh`,
+  `bash`, and `zsh` are allowed only inside the Apple container; controlled
+  Python/Node/Rust/Go/tooling executable policy, deterministic candidate-local
+  PATH, bounded non-secret environment overrides, and no-network default;
 - native repository intelligence, candidate/environment/policy-bound
   verification, durable runs/events/checkpoints, and bounded autonomous-loop
   resume;
@@ -31,9 +35,12 @@ MCP adapter. It includes:
   bounded cache. Signed HTTP credential nonces are documented as uniqueness
   markers rather than consumed transport replay state.
 
-Production MCP has no generic shell, host_exec, arbitrary patch, file creation,
-branch switching, worktree, or autonomous confirmation-issue tools. Public
-output omits host state paths.
+Production MCP has no host_exec, arbitrary patch, file creation, branch
+switching, worktree, or autonomous confirmation-issue tools. It retains the
+exact 31-tool surface; `process_run` is the generic development command path,
+but generic shell is permitted only inside the isolated TaskWorkspace runtime.
+RepoWorker does not expose an unrestricted macOS host shell. Public output
+omits host state paths.
 
 ## Evidence gates
 
@@ -50,9 +57,11 @@ output omits host state paths.
 
 The real Apple test covers workspace-only mount, no-network behavior,
 resource evidence, supervised execution, stale leases, and crash recovery.
-The E2E test covers workspace, runtime, process, bound verification, durable
-loop, publication plan, confirmation-gated integration, live-repository
-isolation, and a close/reopen loop resume with runtime recreation.
+The E2E test covers workspace, runtime, process, shell `go test ./...`,
+failing-shell exit status, candidate-only mutation, process timeout cleanup,
+bound verification, durable loop, publication plan, confirmation-gated
+integration, live-repository isolation, and a close/reopen loop resume with
+runtime recreation.
 The operator-channel tests cover production pending approval, self-approval,
 every binding dimension, expiry, signed-wire replay, concurrent consume, and
 session invalidation after reopen. The MCP-level test replays one logical
@@ -65,7 +74,8 @@ mutating request and observes no duplicate workspace side effect.
   credentials supplied by the operator outside RepoWorker state.
 - Environment installation is registry-bound but no production installer is
   enabled in the composition root; verification images must already contain
-  the required toolchain.
+  the required toolchain. Registry/full runtime networking remains fail closed
+  until domain filtering is implemented.
 - The local tunnel is an external connector process. If it caches an older MCP
   schema, reconnect/re-add the connector and open a new session. The final
   fresh session used for this checkpoint exposed exactly the 31 tools listed in
@@ -74,6 +84,8 @@ mutating request and observes no duplicate workspace side effect.
 ## Current source checkpoint
 
 The verified implementation checkpoint is local commit
-`26ab3aa45ebca6eee6f5c5596f670464b85a6b98` on `main`, descended from the
-prior local source checkpoint `02a44737392bf7b9d6e1b90de6da3e9439fbfa3f`.
+`92a1dc7` (`m3: enable container-confined development shell`) on `main`.
+The final documentation/evidence commit is recorded by the handoff after the
+source checkpoint has passed the fresh live-session probe. No remote has been
+updated.
 No remote push, PR, release, or deployment is part of this work.

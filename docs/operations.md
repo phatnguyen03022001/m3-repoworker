@@ -90,6 +90,40 @@ to action, repository, principal, session, generation, fencing generation,
 candidate snapshot, plan digest, class, and expiry. A scope change, restart,
 expiry, replay, or concurrent second consume is rejected.
 
+## Development shell and general lint execution
+
+After `workspace_create`, `runtime_create`, and `runtime_start`, use the
+existing typed `process_run` tool. It does not invoke a macOS shell directly:
+the command is supervised by the Apple container runtime and runs with CWD
+under `/workspace`.
+
+```text
+executable: sh
+arguments: ["-lc", "printf shell-ok && go test ./..."]
+cwd: /workspace
+timeout_seconds: 120
+```
+
+The same path supports `bash -lc` or `zsh -lc` when present in the selected
+image, repository-local `make` and `./scripts/*.sh`, Go/Node/Python/Rust
+lint/build/test/codegen commands, and package-manager scripts. Examples are
+`go test -race ./...`, `go vet ./...`, `npm run lint`, `npx eslint .`,
+`python -m pytest`, `ruff check .`, `cargo clippy`, and `make verify`.
+Commands, output, timeout, memory, process-group cancellation, runtime state,
+workspace generation, and fencing remain bounded by the existing process
+subsystem.
+
+The runtime PATH is deterministic and includes `/workspace/node_modules/.bin`,
+`/workspace/.venv/bin`, and `/workspace/bin`. Explicit MCP environment values
+must be bounded non-secret `NAME=value` entries; host environment, keychain,
+brew, sudo, host pip, and host npm-global state are not forwarded. The
+candidate workspace may contain local Git operations, but the live checkout is
+never mounted and authenticated push remains outside this capability.
+
+Network mode is `none` by default. `registry` and `full` requests are rejected
+until an Apple adapter can enforce domain filtering; RepoWorker does not widen
+network access as a substitute.
+
 Mutating MCP calls must carry the SDK request metadata keys
 `repoworker/request_id` and `repoworker/request_sequence` in
 `CallToolParams._meta`. The bounded process-local cache rejects duplicate

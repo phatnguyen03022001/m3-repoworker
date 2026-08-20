@@ -14,13 +14,18 @@ events/checkpoints → autonomous loop → optional verified publication`.
   environment identity, and policy version.
 - Apple containers receive only the candidate workspace, no live repository,
   and no network by default.
-- MCP exposes typed operations only; no arbitrary host shell or path mutation.
+- MCP exposes typed operations only. A generic shell is permitted only inside
+  the isolated Apple TaskWorkspace runtime at `/workspace`; RepoWorker does
+  not expose an unrestricted macOS host shell or host path mutation.
 - State is private and durable outside the checkout; recovery is fail-closed.
 - Publication is plan-first and execute requires fresh verification, rechecks,
   and scoped confirmation.
 - Secrets are rejected from environment and durable event/output boundaries.
 - Authentication is transport-bound and fail-closed; operator confirmation is
   outside the autonomous MCP surface.
+- Development network defaults to none. Registry/full modes fail closed until
+  an Apple domain-filtered adapter exists; broad host credentials are never
+  forwarded into a runtime.
 
 ## Definition of done
 
@@ -38,3 +43,6 @@ events/checkpoints → autonomous loop → optional verified publication`.
   mutating MCP request identity is replay-protected at the SDK receiving
   boundary; Git status output is bounded and deterministic.
 - README and operational docs describe the actual commands and limitations.
+- `process_run` can execute repository-local shell, lint, build, test, codegen,
+  and package-manager commands in the candidate runtime with bounded output,
+  timeout, cancellation, and fresh fencing.

@@ -22,9 +22,11 @@ Production MCP is closed-world and has exactly 31 tools. It exposes typed
 repository reads plus read-only `repo_git_status`, workspace lifecycle, Apple
 runtime lifecycle, supervised process argv, verification, durable runs/events,
 autonomous loops, and publication plan/execute. It does not expose
-`confirmation_issue`, shell, host execution, arbitrary file creation/deletion,
-branch switching, or worktree creation. Public output omits host paths and
-uses the stable /workspace mount.
+`confirmation_issue`, host execution, arbitrary file creation/deletion, branch
+switching, or worktree creation. `process_run` does expose a strong generic
+shell capability, but only as `sh/bash/zsh -lc` inside the isolated Apple
+runtime with `/workspace` CWD and the candidate-only mount. Public output
+omits host paths and uses the stable `/workspace` mount.
 
 Destructive integration/publication confirmation is issued only by an
 operator-only authority implemented by the private Unix socket and dedicated
@@ -45,11 +47,14 @@ policy perspective: its allow-listed verification runs use bounded output and
 do not alter the repository authority. The true state-changing MCP operations
 are guarded by request-level replay protection.
 
-Apple runtime defaults to --network none, mounts only the isolated workspace,
+Apple runtime defaults to `--network none`, mounts only the isolated workspace,
 applies CPU/RAM limits, and recovers active records before new mutation.
-Process execution rejects credential-bearing environment variables, uses an
-allow-listed executable name and bounded argv, and kills the process group on
-cancellation/timeout.
+Registry/full network modes fail closed because there is no domain-filtered
+Apple network adapter yet. Process execution rejects credential-bearing and
+baseline-overriding environment variables, uses a typed executable name and
+bounded argv, passes only explicit `key=value` values, and kills the process
+group on cancellation/timeout. The baseline PATH includes candidate-local
+tool directories but never inherits the host environment.
 
 Event and loop payloads are bounded and reject common credential markers.
 Verification diagnostics are redacted and bounded. Publication never places
