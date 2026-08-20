@@ -59,6 +59,7 @@ type Runtime struct {
 	GenerationID    string    `json:"generation_id"`
 	LeaseGeneration uint64    `json:"lease_generation"`
 	WorkspacePath   string    `json:"workspace_path"`
+	Image           string    `json:"image"`
 	Identity        string    `json:"identity"`
 	State           State     `json:"state"`
 	CreatedAt       time.Time `json:"created_at"`
@@ -114,12 +115,28 @@ func (m *Manager) Create(ctx context.Context, spec RuntimeSpec, backend string) 
 	if err := m.validateSpec(ctx, spec); err != nil {
 		return Runtime{}, err
 	}
-	if _, exists := m.runtimes[spec.Generation.ID]; exists {
-		return Runtime{}, ErrRejected
+	if existing, exists := m.runtimes[spec.Generation.ID]; exists {
+		if existing.State != StateStopped {
+			return Runtime{}, ErrRejected
+		}
+		if existing.ExternalID != "" {
+			cleanupAdapter, cleanupOK := m.adapters[existing.Backend]
+			if !cleanupOK || cleanupAdapter.Delete(ctx, existing.ExternalID) != nil {
+				existing.State = StateQuarantined
+				existing.UpdatedAt = time.Now().UTC()
+				m.runtimes[spec.Generation.ID] = existing
+				_ = m.persist(existing)
+				return Runtime{}, ErrRejected
+			}
+		}
+		if err := os.Remove(m.runtimePath(existing.ID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return Runtime{}, ErrRejected
+		}
+		delete(m.runtimes, spec.Generation.ID)
 	}
 	id := runtimeID(spec, backend)
 	now := time.Now().UTC()
-	runtime := Runtime{ID: id, Backend: backend, TaskID: spec.TaskID, GenerationID: spec.Generation.ID, LeaseGeneration: spec.Lease.FencingGeneration, WorkspacePath: spec.WorkspacePath, Identity: id, State: StateCreating, CreatedAt: now, UpdatedAt: now}
+	runtime := Runtime{ID: id, Backend: backend, TaskID: spec.TaskID, GenerationID: spec.Generation.ID, LeaseGeneration: spec.Lease.FencingGeneration, WorkspacePath: spec.WorkspacePath, Image: spec.Image, Identity: id, State: StateCreating, CreatedAt: now, UpdatedAt: now}
 	m.runtimes[spec.Generation.ID] = runtime
 	if err := m.persist(runtime); err != nil {
 		delete(m.runtimes, spec.Generation.ID)
@@ -130,6 +147,7 @@ func (m *Manager) Create(ctx context.Context, spec RuntimeSpec, backend string) 
 		runtime.State = StateFailed
 		runtime.UpdatedAt = time.Now().UTC()
 		_ = m.persist(runtime)
+		m.runtimes[spec.Generation.ID] = runtime
 		return Runtime{}, ErrRejected
 	}
 	runtime.ExternalID = externalID
@@ -210,8 +228,10 @@ func (m *Manager) Delete(ctx context.Context, generationID string, lease workspa
 	if lease.GenerationID != runtime.GenerationID || lease.FencingGeneration != runtime.LeaseGeneration || m.repository.AssertLease(ctx, lease) != nil {
 		return ErrRejected
 	}
-	if err := adapter.Delete(ctx, runtime.ExternalID); err != nil {
-		return ErrRejected
+	if runtime.ExternalID != "" {
+		if err := adapter.Delete(ctx, runtime.ExternalID); err != nil {
+			return ErrRejected
+		}
 	}
 	delete(m.runtimes, generationID)
 	return os.Remove(m.runtimePath(runtime.ID))
@@ -259,11 +279,20 @@ func (m *Manager) Recover(ctx context.Context) error {
 		if runtime.State != StateCreating && runtime.State != StateRunning && runtime.State != StateStopping {
 			continue
 		}
-		adapter, ok := m.adapters[runtime.Backend]
-		if !ok || adapter.Stop(ctx, runtime.ExternalID) != nil || adapter.Delete(ctx, runtime.ExternalID) != nil {
+		generation, generationErr := m.repository.LoadGeneration(ctx, generationID)
+		lease, leaseErr := m.repository.CurrentLease(ctx, generationID)
+		if generationErr != nil || leaseErr != nil || generation.Path != runtime.WorkspacePath || lease.FencingGeneration != runtime.LeaseGeneration {
 			runtime.State = StateQuarantined
-		} else {
+		} else if runtime.ExternalID == "" {
 			runtime.State = StateStopped
+		} else {
+			adapter, ok := m.adapters[runtime.Backend]
+			if !ok || adapter.Stop(ctx, runtime.ExternalID) != nil || adapter.Delete(ctx, runtime.ExternalID) != nil {
+				runtime.State = StateQuarantined
+			} else {
+				runtime.State = StateStopped
+				runtime.ExternalID = ""
+			}
 		}
 		runtime.UpdatedAt = time.Now().UTC()
 		m.runtimes[generationID] = runtime
@@ -373,7 +402,8 @@ func validBackend(value string) bool {
 }
 
 func validRuntime(runtime Runtime) bool {
-	return runtime.ID != "" && validBackend(runtime.Backend) && (runtime.ExternalID != "" || runtime.State == StateCreating) && runtime.TaskID != "" && runtime.GenerationID != "" && runtime.LeaseGeneration > 0 && filepath.IsAbs(runtime.WorkspacePath) && runtime.Identity == runtime.ID && runtime.State != ""
+	externalIdentityValid := runtime.ExternalID != "" || runtime.State == StateCreating || runtime.State == StateStopped || runtime.State == StateFailed || runtime.State == StateQuarantined
+	return runtime.ID != "" && validBackend(runtime.Backend) && externalIdentityValid && runtime.TaskID != "" && runtime.GenerationID != "" && runtime.LeaseGeneration > 0 && filepath.IsAbs(runtime.WorkspacePath) && runtime.Image != "" && runtime.Identity == runtime.ID && runtime.State != ""
 }
 
 func runtimeID(spec RuntimeSpec, backend string) string {

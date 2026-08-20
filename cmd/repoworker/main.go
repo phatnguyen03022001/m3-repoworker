@@ -11,6 +11,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/tienphat/m3-repoworker/internal/controlplane"
 	"github.com/tienphat/m3-repoworker/internal/repo"
+	"github.com/tienphat/m3-repoworker/internal/security"
 	"github.com/tienphat/m3-repoworker/internal/taskstate"
 	"github.com/tienphat/m3-repoworker/internal/verify"
 )
@@ -115,7 +116,11 @@ var errRequestRejected = errors.New("request rejected")
 func boolPtr(v bool) *bool { return &v }
 
 func newServer(repoRoot, stateRoot string) (*mcp.Server, *controlplane.Plane, error) {
-	plane, err := controlplane.Open(context.Background(), controlplane.Config{RepositoryRoot: repoRoot, StateRoot: stateRoot})
+	return newServerWithProvider(repoRoot, stateRoot, nil)
+}
+
+func newServerWithProvider(repoRoot, stateRoot string, provider security.PrincipalProvider) (*mcp.Server, *controlplane.Plane, error) {
+	plane, err := controlplane.Open(context.Background(), controlplane.Config{RepositoryRoot: repoRoot, StateRoot: stateRoot, PrincipalProvider: provider})
 	if err != nil {
 		return nil, nil, errRequestRejected
 	}
@@ -146,6 +151,23 @@ func newServerForComponents(workspace *repo.Workspace, tasks taskstate.StateStor
 		},
 		func(context.Context, *mcp.CallToolRequest, StatusInput) (*mcp.CallToolResult, StatusOutput, error) {
 			return nil, StatusOutput{Status: "ok"}, nil
+		},
+	)
+
+	mcp.AddTool(
+		server,
+		&mcp.Tool{
+			Name:        "repo_git_status",
+			Title:       "Read Git status",
+			Description: "Return typed read-only Git status bound to the opened repository authority.",
+			Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true, DestructiveHint: boolPtr(false), OpenWorldHint: boolPtr(false)},
+		},
+		func(ctx context.Context, _ *mcp.CallToolRequest, _ RepoSnapshotInput) (*mcp.CallToolResult, repo.GitStatus, error) {
+			status, err := workspace.GitStatus(ctx)
+			if err != nil {
+				return nil, repo.GitStatus{}, safeToolError(err)
+			}
+			return nil, status, nil
 		},
 	)
 
@@ -453,6 +475,7 @@ func main() {
 	flags.SetOutput(os.Stderr)
 	repoRoot := flags.String("repo-root", "", "absolute repository root")
 	stateRoot := flags.String("state-dir", "", "absolute persistent task state directory outside the repository")
+	trustedPrincipal := flags.String("trusted-principal", "", "explicit principal for an already-authenticated local transport")
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		log.Fatal("invalid startup configuration")
 	}
@@ -464,13 +487,24 @@ func main() {
 			log.Fatal("invalid startup configuration")
 		}
 	}
-	if err := run(context.Background(), &mcp.StdioTransport{}, *repoRoot, resolvedStateRoot); err != nil {
+	if *trustedPrincipal == "" {
+		log.Fatal("missing explicit transport authentication configuration")
+	}
+	provider, err := security.NewTrustedPrincipalProvider(*trustedPrincipal)
+	if err != nil {
+		log.Fatal("invalid transport authentication configuration")
+	}
+	if err := runWithProvider(context.Background(), &mcp.StdioTransport{}, *repoRoot, resolvedStateRoot, provider); err != nil {
 		log.Fatal(err)
 	}
 }
 
 func run(ctx context.Context, transport mcp.Transport, repoRoot, stateRoot string) error {
-	server, plane, err := newServer(repoRoot, stateRoot)
+	return runWithProvider(ctx, transport, repoRoot, stateRoot, nil)
+}
+
+func runWithProvider(ctx context.Context, transport mcp.Transport, repoRoot, stateRoot string, provider security.PrincipalProvider) error {
+	server, plane, err := newServerWithProvider(repoRoot, stateRoot, provider)
 	if err != nil {
 		return errRequestRejected
 	}

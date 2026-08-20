@@ -3,13 +3,18 @@ package controlplane
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/tienphat/m3-repoworker/internal/intelligence"
+	"github.com/tienphat/m3-repoworker/internal/loop"
 	"github.com/tienphat/m3-repoworker/internal/repo"
+	m3runtime "github.com/tienphat/m3-repoworker/internal/runtime"
+	"github.com/tienphat/m3-repoworker/internal/security"
 )
 
 func TestOpenBindsWorkspaceEnvironmentAndCandidateOnly(t *testing.T) {
@@ -21,7 +26,11 @@ func TestOpenBindsWorkspaceEnvironmentAndCandidateOnly(t *testing.T) {
 	writeFixtureFile(t, filepath.Join(root, "main.go"), "package main\n\nfunc main() {}\n")
 	initFixtureGit(t, root)
 
-	plane, err := Open(context.Background(), Config{RepositoryRoot: root, StateRoot: t.TempDir(), Image: "fixture-image"})
+	provider, err := security.NewTrustedPrincipalProvider("controlplane-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plane, err := Open(context.Background(), Config{RepositoryRoot: root, StateRoot: t.TempDir(), Image: "fixture-image", PrincipalProvider: provider})
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -84,6 +93,142 @@ func TestOpenBindsWorkspaceEnvironmentAndCandidateOnly(t *testing.T) {
 	}
 	if _, err := os.Stat(record.Generation.Path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("discarded workspace still exists: %v", err)
+	}
+}
+
+func TestCloseOpenResumeLoopReprovisionsRuntime(t *testing.T) {
+	root := t.TempDir()
+	writeFixtureFile(t, filepath.Join(root, "go.mod"), "module example.invalid/reopen\n\ngo 1.26.6\n")
+	writeFixtureFile(t, filepath.Join(root, "main.go"), "package main\n\nfunc main() {}\n")
+	initFixtureGit(t, root)
+	fakeBin := t.TempDir()
+	stateFile := filepath.Join(fakeBin, "container-state")
+	logFile := filepath.Join(fakeBin, "container.log")
+	cacheRoot := filepath.Join(fakeBin, "go-cache")
+	moduleCache := filepath.Join(fakeBin, "go-mod-cache")
+	fakeContainer := filepath.Join(fakeBin, "container")
+	script := fmt.Sprintf(`#!/bin/sh
+set -eu
+state=%q
+log=%q
+export HOME=%q
+export GOCACHE=%q
+export GOMODCACHE=%q
+command="${1:-}"
+if [ "$#" -gt 0 ]; then shift; fi
+printf '%%s %%s\\n' "$command" "$*" >> "$log"
+case "$command" in
+create)
+  workspace=""
+  for argument in "$@"; do
+    case "$argument" in
+      source=*,target=/workspace*) workspace="${argument#source=}"; workspace="${workspace%%,target=/workspace*}" ;;
+    esac
+  done
+  printf '%%s' "$workspace" > "$state"
+  ;;
+start|stop|rm)
+  ;;
+exec)
+  if [ "${1:-}" = "--workdir" ]; then shift 2; fi
+  runtime="${1:-}"
+  if [ -z "$runtime" ]; then exit 1; fi
+  shift
+  workspace=$(cat "$state")
+  cd "$workspace"
+  sleep 2
+  set +e
+  "$@" >> "$log" 2>&1
+  status=$?
+  set -e
+  printf 'exec-exit %%s\\n' "$status" >> "$log"
+  exit "$status"
+  ;;
+*)
+  ;;
+esac
+	`, stateFile, logFile, fakeBin, cacheRoot, moduleCache)
+	if err := os.WriteFile(fakeContainer, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	provider, err := security.NewTrustedPrincipalProvider("reopen-caller")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	stateRoot := t.TempDir()
+	first, err := Open(ctx, Config{RepositoryRoot: root, StateRoot: stateRoot, Image: "fixture-image", PrincipalProvider: provider})
+	if err != nil {
+		t.Fatalf("Open(first) error = %v", err)
+	}
+	record, err := first.CreateWorkspace(ctx, "task_reopen")
+	if err != nil {
+		first.Close()
+		t.Fatalf("CreateWorkspace() error = %v", err)
+	}
+	runtimeRecord, err := first.RuntimeCreate(ctx, record.Generation.ID, "", "apple-container", 1, 128<<20)
+	if err != nil {
+		first.Close()
+		t.Fatalf("RuntimeCreate() error = %v", err)
+	}
+	if _, err := first.RuntimeStart(ctx, record.Generation.ID); err != nil {
+		first.Close()
+		t.Fatalf("RuntimeStart() error = %v", err)
+	}
+	plan, err := first.PlanVerification(ctx, record.Generation.ID, intelligence.Target{})
+	if err != nil {
+		first.Close()
+		t.Fatalf("PlanVerification() error = %v", err)
+	}
+	patch := "--- a/main.go\n+++ b/main.go\n@@ -1,3 +1,3 @@\n package main\n \n-func main() {}\n+func main() { println(\"reopened\") }\n"
+	run, err := first.StartLoop(ctx, "task_reopen", record.Generation.ID, runtimeRecord.ID, patch, plan)
+	if err != nil {
+		first.Close()
+		t.Fatalf("StartLoop() error = %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close(first) error = %v", err)
+	}
+
+	second, err := Open(ctx, Config{RepositoryRoot: root, StateRoot: stateRoot, Image: "fixture-image", PrincipalProvider: provider})
+	if err != nil {
+		t.Fatalf("Open(second) error = %v", err)
+	}
+	status, err := second.ResumeLoop(ctx, run.ID)
+	if err != nil {
+		second.Close()
+		t.Fatalf("ResumeLoop() error = %v", err)
+	}
+	if status.ID != run.ID || status.Status != "running" {
+		second.Close()
+		t.Fatalf("ResumeLoop() = %#v, want running same run", status)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	var final LoopStatus
+	for time.Now().Before(deadline) {
+		final, err = second.LoopStatus(ctx, run.ID)
+		if err != nil {
+			second.Close()
+			t.Fatal(err)
+		}
+		if final.State.Phase == loop.PhaseCompleted || final.State.Phase == loop.PhaseFailed || final.State.Phase == loop.PhaseHumanCheckpoint {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	defer second.Close()
+	if final.State.Phase != loop.PhaseCompleted {
+		log, _ := os.ReadFile(logFile)
+		t.Fatalf("reopened loop state = %#v, run = %#v, container log = %s", final.State, final.Run, log)
+	}
+	recreated, err := second.RuntimeStatus(ctx, record.Generation.ID)
+	if err != nil || recreated.ID == runtimeRecord.ID || recreated.LeaseGeneration <= runtimeRecord.LeaseGeneration || recreated.State != m3runtime.StateRunning {
+		t.Fatalf("recreated runtime = %#v, old=%#v, error=%v", recreated, runtimeRecord, err)
+	}
+	if _, err := os.Stat(filepath.Join(record.Generation.Path, "main.go")); err != nil {
+		t.Fatal(err)
 	}
 }
 

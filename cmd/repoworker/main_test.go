@@ -12,6 +12,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/tienphat/m3-repoworker/internal/repo"
+	"github.com/tienphat/m3-repoworker/internal/security"
 	"github.com/tienphat/m3-repoworker/internal/taskstate"
 	"github.com/tienphat/m3-repoworker/internal/verify"
 )
@@ -51,15 +52,15 @@ func TestRepoStatusTool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list tools: %v", err)
 	}
-	if len(tools.Tools) != 12 {
-		t.Fatalf("tool count = %d, want 12", len(tools.Tools))
+	if len(tools.Tools) != 13 {
+		t.Fatalf("tool count = %d, want 13", len(tools.Tools))
 	}
 
 	toolByName := make(map[string]*mcp.Tool)
 	for _, tool := range tools.Tools {
 		toolByName[tool.Name] = tool
 	}
-	for _, name := range []string{"repo_status", "repo_read", "repo_search", "repo_snapshot", "task_status"} {
+	for _, name := range []string{"repo_status", "repo_read", "repo_search", "repo_snapshot", "repo_git_status", "task_status"} {
 		tool := toolByName[name]
 		if tool == nil || tool.Annotations == nil || !tool.Annotations.ReadOnlyHint || !tool.Annotations.IdempotentHint || tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint || tool.Annotations.OpenWorldHint == nil || *tool.Annotations.OpenWorldHint {
 			t.Errorf("%s annotations = %#v, want read-only, idempotent, closed-world, and non-destructive", name, tool)
@@ -127,7 +128,7 @@ func TestProductionMCPToolSurface(t *testing.T) {
 			t.Fatalf("git %v: %v: %s", args, err, output)
 		}
 	}
-	server, plane, err := newServer(root, t.TempDir())
+	server, plane, err := newServerWithProvider(root, t.TempDir(), testPrincipalProvider(t))
 	if err != nil {
 		t.Fatalf("newServer() error = %v", err)
 	}
@@ -152,26 +153,53 @@ func TestProductionMCPToolSurface(t *testing.T) {
 	for _, tool := range tools.Tools {
 		toolByName[tool.Name] = tool
 	}
-	for _, name := range []string{
-		"repo_status", "repo_read", "repo_search", "repo_snapshot",
+	expectedTools := []string{
+		"repo_status", "repo_read", "repo_search", "repo_snapshot", "repo_git_status", "repo_verify",
 		"workspace_create", "workspace_status", "workspace_discard", "workspace_integration_plan", "workspace_integrate",
 		"runtime_create", "runtime_start", "runtime_stop", "runtime_status",
 		"process_run", "process_read", "process_signal", "process_cancel", "process_wait",
 		"verification_plan", "verification_run", "verification_status",
 		"run_create", "run_event_append", "run_events",
 		"loop_start", "loop_resume", "loop_status", "publication_plan", "publication_execute",
-	} {
+	}
+	expected := make(map[string]struct{}, len(expectedTools))
+	for _, name := range expectedTools {
+		expected[name] = struct{}{}
 		if toolByName[name] == nil {
 			t.Errorf("production tool %q is missing", name)
 		}
 	}
-	for _, name := range []string{"apply_patch", "create_file", "delete_file", "host_exec", "shell"} {
+	if len(tools.Tools) != len(expectedTools) {
+		t.Fatalf("production tool count = %d, want exact %d", len(tools.Tools), len(expectedTools))
+	}
+	for _, tool := range tools.Tools {
+		if _, ok := expected[tool.Name]; !ok {
+			t.Errorf("unexpected production tool %q", tool.Name)
+		}
+	}
+	for _, name := range []string{"apply_patch", "create_file", "delete_file", "host_exec", "shell", "confirmation_issue"} {
 		if toolByName[name] != nil {
 			t.Errorf("unsafe or maintenance-only tool %q is exposed in production", name)
 		}
 	}
-	if len(tools.Tools) < 29 {
-		t.Fatalf("production tool count = %d, want at least 29 typed tools", len(tools.Tools))
+	gitStatusTool := toolByName["repo_git_status"]
+	if gitStatusTool == nil || gitStatusTool.Annotations == nil || !gitStatusTool.Annotations.ReadOnlyHint || !gitStatusTool.Annotations.IdempotentHint || gitStatusTool.Annotations.DestructiveHint == nil || *gitStatusTool.Annotations.DestructiveHint || gitStatusTool.Annotations.OpenWorldHint == nil || *gitStatusTool.Annotations.OpenWorldHint {
+		t.Errorf("repo_git_status annotations = %#v, want read-only, idempotent, non-destructive, closed-world", gitStatusTool)
+	}
+	gitResult, err := clientSession.CallTool(context.Background(), &mcp.CallToolParams{Name: "repo_git_status"})
+	if err != nil || gitResult.IsError {
+		t.Fatalf("repo_git_status call = %#v, %v", gitResult, err)
+	}
+	gitOutput, ok := gitResult.StructuredContent.(map[string]any)
+	if !ok || gitOutput["branch"] != "main" || gitOutput["dirty"] != false {
+		t.Fatalf("repo_git_status output = %#v, want clean main status", gitResult.StructuredContent)
+	}
+}
+
+func TestProductionServerRejectsMissingAuthenticationProvider(t *testing.T) {
+	root := t.TempDir()
+	if _, _, err := newServer(root, t.TempDir()); err == nil {
+		t.Fatal("production server opened without an explicit authentication provider")
 	}
 }
 
@@ -189,7 +217,7 @@ func TestProductionRepoVerifyPresetsSequentially(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, plane, err := newServer(root, t.TempDir())
+	server, plane, err := newServerWithProvider(root, t.TempDir(), testPrincipalProvider(t))
 	if err != nil {
 		t.Fatalf("newServer() error = %v", err)
 	}
@@ -239,9 +267,18 @@ func TestRunTreatsEOFAsCleanShutdown(t *testing.T) {
 		Reader: io.NopCloser(strings.NewReader("")),
 		Writer: nopWriteCloser{Writer: io.Discard},
 	}
-	if err := run(context.Background(), transport, root, t.TempDir()); err != nil {
+	if err := runWithProvider(context.Background(), transport, root, t.TempDir(), testPrincipalProvider(t)); err != nil {
 		t.Fatalf("run() error = %v, want nil", err)
 	}
+}
+
+func testPrincipalProvider(t *testing.T) security.PrincipalProvider {
+	t.Helper()
+	provider, err := security.NewTrustedPrincipalProvider("mcp-test-client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return provider
 }
 
 func TestMCPRepositoryToolsAndSanitizedRejection(t *testing.T) {

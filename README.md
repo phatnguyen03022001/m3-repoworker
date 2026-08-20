@@ -20,8 +20,14 @@ Nếu chỉ muốn chạy process trực tiếp:
 ```sh
 go run ./cmd/repoworker \
   -repo-root /Users/tienphat/Developer/m3-repoworker \
-  -state-dir "$HOME/.repoworker-state"
+  -state-dir "$HOME/.repoworker-state" \
+  -trusted-principal local-cli
 ```
+
+`-trusted-principal` is explicit configuration for a connector that has
+already authenticated the transport. It is not an MCP caller field; omitting
+it fails closed. HTTP transports may instead use the signed
+`Authorization: Bearer rw1...` credential bound to the transport session.
 
 Nếu tunnel đã được cấu hình:
 
@@ -46,9 +52,10 @@ make offline-verify
 ```
 
 Các lệnh Go dùng cache riêng trong `.cache/`; `offline-verify` chỉ chạy sau khi
-`bootstrap` đã tải đủ module. `make verify` chạy format, vet, test thường và
-race, typed MCP surface tests, module verification, build reproducible, và
-Lima validation. Binary nằm ở `bin/repoworker`.
+`bootstrap` đã tải đủ module. `make verify` chạy fast gates, Lima validation,
+và cả hai real DoD gates. Nếu Apple prerequisite thiếu, gate báo `NOT RUN` và
+trả lỗi; không coi `SKIP` là GREEN. `make offline-verify` chỉ là offline gate
+và không thay thế real DoD gate. Binary nằm ở `bin/repoworker`.
 
 Apple prerequisite:
 
@@ -56,8 +63,20 @@ Apple prerequisite:
 container machine create --name repoworker alpine:3.22
 ```
 
-Real Apple E2E dùng `REPOWORKER_REAL_E2E=1`; image có thể chỉ định bằng
-`REPOWORKER_APPLE_VERIFY_IMAGE`.
+Real Apple lifecycle gate:
+
+```sh
+go test ./internal/runtime \
+  -run TestAppleContainerRealLifecycle -count=1 -v
+```
+
+Real M3 E2E dùng `REPOWORKER_REAL_E2E=1`; image có thể chỉ định bằng
+`REPOWORKER_APPLE_VERIFY_IMAGE`:
+
+```sh
+REPOWORKER_REAL_E2E=1 go test ./internal/controlplane \
+  -run TestControlPlaneRealM3EndToEnd -count=1 -v
+```
 
 ## Local tunnel
 
@@ -78,10 +97,24 @@ thể đang cache schema cũ.
 
 ## Production MCP surface
 
-Production chỉ expose typed tools: `repo_*`, `workspace_*`, `runtime_*`,
-`process_*`, `verification_*`, `run_*`, `loop_*`, `publication_plan`,
-`publication_execute`, và `confirmation_issue`. Không có client shell, host
-execution, arbitrary file mutation, branch switching, hay worktree creation.
+Production expose đúng 31 typed tools:
+
+```text
+repo_status repo_read repo_search repo_snapshot repo_git_status repo_verify
+workspace_create workspace_status workspace_discard workspace_integration_plan workspace_integrate
+runtime_create runtime_start runtime_stop runtime_status
+process_run process_read process_signal process_cancel process_wait
+verification_plan verification_run verification_status
+run_create run_event_append run_events
+loop_start loop_resume loop_status
+publication_plan publication_execute
+```
+
+`repo_git_status` là read-only và trả repository identity, trusted root
+identity, branch, full HEAD SHA, dirty state, và changed paths. Không có
+`confirmation_issue`, client shell, host execution, arbitrary file mutation,
+branch switching, hay worktree creation. Confirmation được cấp qua
+operator-only authority riêng và không bao giờ qua autonomous MCP.
 Candidate edit chỉ xảy ra trong TaskWorkspace đã lease và qua autonomous loop
 bị giới hạn.
 

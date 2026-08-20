@@ -1,28 +1,37 @@
 # Implementation status
 
-## M3.1–M3.10 — implemented on local main
+## M3.1–M3.10 — audit repair on local main
 
 The production path is wired through internal/controlplane and the production
 MCP adapter. It includes:
 
 - transactional task state, isolated TaskWorkspace generations, leases,
   descriptor-relative integration, memory, and crash recovery;
-- deny-by-default security with local principal/session binding, nonce replay
-  protection, confirmations, mount/network/executable policy, and audit;
+- deny-by-default security with transport-authenticated principal/session
+  binding, nonce replay protection, trusted-main binding, typed capabilities,
+  operator-only confirmations, mount/network/executable policy, and audit;
 - bounded supervised processes, Apple container lifecycle, Lima validation,
   scheduler/resource admission, environment identities and private caches;
 - native repository intelligence, candidate/environment/policy-bound
   verification, durable runs/events/checkpoints, and bounded autonomous-loop
   resume;
 - typed plan-first publication with candidate/ref rechecks and scoped execute
-  confirmation.
+  confirmation;
+- durable reopen recovery with generation validation/quarantine, runtime
+  stop/delete recovery, fresh lease fencing, deterministic environment
+  rehydration, and runtime re-provision/rebind;
+- typed read-only `repo_git_status` and an exact 31-tool production MCP
+  surface with no autonomous confirmation minting.
 
 Production MCP has no generic shell, host_exec, arbitrary patch, file creation,
-branch switching, or worktree tools. Public output omits host state paths.
+branch switching, worktree, or autonomous confirmation-issue tools. Public
+output omits host state paths.
 
 ## Evidence gates
 
-- Warm verification: `make verify`.
+- Fast verification: `make ci`.
+- Full verification: `make verify` (includes real Apple and real M3 E2E gates;
+  missing prerequisites are failures).
 - Offline verification: `make bootstrap` followed by `make offline-verify`.
 - Fresh-cache proof: `scripts/cold-cache-verify.sh`.
 - Real Apple lifecycle: `go test ./internal/runtime -run
@@ -34,8 +43,8 @@ branch switching, or worktree tools. Public output omits host state paths.
 The real Apple test covers workspace-only mount, no-network behavior,
 resource evidence, supervised execution, stale leases, and crash recovery.
 The E2E test covers workspace, runtime, process, bound verification, durable
-loop, publication plan, confirmation-gated integration, and live-repository
-isolation.
+loop, publication plan, confirmation-gated integration, live-repository
+isolation, and a close/reopen loop resume with runtime recreation.
 
 ## Known limitations
 
@@ -48,7 +57,8 @@ isolation.
 - The local tunnel is an external connector process. If it caches an older MCP
   schema, reconnect/re-add the connector and open a new session.
 
-## Exact next action
+## Current source checkpoint
 
-Run the final clean-main gate, confirm the tunnel is ready, and commit the
-verified implementation locally on main. Do not push the remote.
+The source was audited from local HEAD `72a2c8c7fd18a496aad368aa4d6542bb7af5080f`.
+The final local checkpoint must update this line after the automated and real
+gates pass. No remote push, PR, release, or deployment is part of this work.

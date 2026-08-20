@@ -1,5 +1,5 @@
 // Package controlplane is the production composition root for RepoWorker.
-// It owns the authenticated local principal, wires every M3 subsystem, and
+// It owns one authenticated transport principal, wires every M3 subsystem, and
 // exposes typed operations to the MCP adapter without exposing host shell
 // capabilities.
 package controlplane
@@ -36,12 +36,13 @@ var (
 	ErrStale    = errors.New("control plane candidate is stale")
 )
 
-const localPrincipal = "local-dev"
-
 type Config struct {
-	RepositoryRoot string
-	StateRoot      string
-	Image          string
+	RepositoryRoot    string
+	StateRoot         string
+	Image             string
+	PrincipalProvider security.PrincipalProvider
+	Transport         security.TransportMetadata
+	OperatorAuthority security.OperatorAuthority
 }
 
 type WorkspaceRecord struct {
@@ -71,6 +72,7 @@ type Plane struct {
 	Tasks       taskstate.StateStore
 	Memory      *memory.Store
 	Security    *security.Engine
+	Operator    security.OperatorAuthority
 	Processes   *process.Supervisor
 	Runtimes    *m3runtime.Manager
 	Scheduler   *scheduler.Scheduler
@@ -85,6 +87,8 @@ type Plane struct {
 	StateRoot    string
 
 	mu            sync.Mutex
+	loopWG        sync.WaitGroup
+	loopCancels   map[string]context.CancelFunc
 	session       security.Session
 	trustedRef    string
 	workspaces    map[string]WorkspaceRecord
@@ -96,7 +100,7 @@ type Plane struct {
 }
 
 func Open(ctx context.Context, config Config) (*Plane, error) {
-	if ctx == nil || config.RepositoryRoot == "" || config.StateRoot == "" || !filepath.IsAbs(config.RepositoryRoot) || !filepath.IsAbs(config.StateRoot) || filepath.Clean(config.RepositoryRoot) == filepath.Clean(config.StateRoot) {
+	if ctx == nil || config.RepositoryRoot == "" || config.StateRoot == "" || config.PrincipalProvider == nil || !filepath.IsAbs(config.RepositoryRoot) || !filepath.IsAbs(config.StateRoot) || filepath.Clean(config.RepositoryRoot) == filepath.Clean(config.StateRoot) {
 		return nil, ErrRejected
 	}
 	if config.Image == "" {
@@ -104,6 +108,11 @@ func Open(ctx context.Context, config Config) (*Plane, error) {
 	}
 	readRepo, err := repo.New(config.RepositoryRoot)
 	if err != nil {
+		return nil, ErrRejected
+	}
+	principal, err := config.PrincipalProvider.Authenticate(ctx, config.Transport)
+	if err != nil {
+		_ = readRepo.Close()
 		return nil, ErrRejected
 	}
 	isolated, err := workspace.OpenRepository(readRepo.StartupPath(), config.StateRoot)
@@ -126,13 +135,13 @@ func Open(ctx context.Context, config Config) (*Plane, error) {
 		_ = readRepo.Close()
 		return nil, ErrRejected
 	}
-	_, trustedRef, err := engine.EnrollRepository(ctx, localPrincipal, repositoryID, filesystemID)
+	_, trustedRef, err := engine.EnrollRepository(ctx, principal.ID, repositoryID, filesystemID)
 	if err != nil {
 		_ = isolated.Close()
 		_ = readRepo.Close()
 		return nil, ErrRejected
 	}
-	session, err := engine.OpenSession(ctx, localPrincipal, repositoryID, 24*time.Hour)
+	session, err := engine.OpenAuthenticatedSession(ctx, principal, repositoryID, 24*time.Hour)
 	if err != nil {
 		_ = isolated.Close()
 		_ = readRepo.Close()
@@ -168,7 +177,7 @@ func Open(ctx context.Context, config Config) (*Plane, error) {
 		return nil, ErrRejected
 	}
 	runtimes, err := m3runtime.NewManager(isolated, filepath.Join(config.StateRoot, "runtimes"), m3runtime.AppleContainerAdapter{}, m3runtime.LimaAdapter{})
-	if err != nil || runtimes.Recover(ctx) != nil {
+	if err != nil || runtimes.Recover(ctx) != nil || isolated.Recover(ctx) != nil {
 		_ = eventStore.Close()
 		_ = memoryStore.Close()
 		_ = isolated.Close()
@@ -224,7 +233,7 @@ func Open(ctx context.Context, config Config) (*Plane, error) {
 		_ = readRepo.Close()
 		return nil, ErrRejected
 	}
-	plane = &Plane{Repo: readRepo, Repository: isolated, Tasks: tasks, Memory: memoryStore, Security: engine, Processes: processes, Runtimes: runtimes, Scheduler: schedulerInstance, Environment: environments, Events: eventStore, Publication: publicationAdapter, RepositoryID: repositoryID, FilesystemID: filesystemID, PrincipalID: localPrincipal, SessionID: session.ID, StateRoot: config.StateRoot, session: session, trustedRef: trustedRef, workspaces: map[string]WorkspaceRecord{}, runtimes: map[string]m3runtime.Runtime{}, processes: map[string]ProcessRecord{}, verifications: map[string]VerificationRecord{}, environments: map[string]environment.Generation{}, image: config.Image}
+	plane = &Plane{Repo: readRepo, Repository: isolated, Tasks: tasks, Memory: memoryStore, Security: engine, Operator: config.OperatorAuthority, Processes: processes, Runtimes: runtimes, Scheduler: schedulerInstance, Environment: environments, Events: eventStore, Publication: publicationAdapter, RepositoryID: repositoryID, FilesystemID: filesystemID, PrincipalID: principal.ID, SessionID: session.ID, StateRoot: config.StateRoot, session: session, trustedRef: trustedRef, workspaces: map[string]WorkspaceRecord{}, runtimes: map[string]m3runtime.Runtime{}, processes: map[string]ProcessRecord{}, verifications: map[string]VerificationRecord{}, environments: map[string]environment.Generation{}, loopCancels: map[string]context.CancelFunc{}, image: config.Image}
 	return plane, nil
 }
 
@@ -232,6 +241,12 @@ func (p *Plane) Close() error {
 	if p == nil {
 		return nil
 	}
+	p.mu.Lock()
+	for _, cancel := range p.loopCancels {
+		cancel()
+	}
+	p.mu.Unlock()
+	p.loopWG.Wait()
 	if p.Events != nil {
 		_ = p.Events.Close()
 	}
@@ -252,13 +267,17 @@ func defaultPolicy() security.Policy {
 }
 
 func (p *Plane) authorize(ctx context.Context, capability security.Capability, target security.TargetKind, path string, execution security.ExecutionSpec, confirmation string, generation workspace.Generation) error {
+	return p.authorizeWithBinding(ctx, capability, target, path, execution, confirmation, security.ConfirmationBinding{}, generation)
+}
+
+func (p *Plane) authorizeWithBinding(ctx context.Context, capability security.Capability, target security.TargetKind, path string, execution security.ExecutionSpec, confirmation string, confirmationBinding security.ConfirmationBinding, generation workspace.Generation) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p == nil {
 		return ErrRejected
 	}
 	binding := security.Binding{RepositoryID: p.RepositoryID, FilesystemID: p.FilesystemID, LiveRepository: p.Repository.LiveRoot(), TaskWorkspace: generation.Path, WorkspaceID: generation.ID}
-	request := security.Request{SessionID: p.session.ID, PrincipalID: p.PrincipalID, RepositoryID: p.RepositoryID, Nonce: p.session.Nonce, Capability: capability, Target: target, Path: path, TrustedIntegrationRef: p.trustedRef, ConfirmationToken: confirmation, Execution: execution}
+	request := security.Request{SessionID: p.session.ID, PrincipalID: p.PrincipalID, RepositoryID: p.RepositoryID, Nonce: p.session.Nonce, Capability: capability, Target: target, Path: path, TrustedIntegrationRef: p.trustedRef, ConfirmationToken: confirmation, ConfirmationBinding: confirmationBinding, Execution: execution}
 	decision, err := p.Security.Authorize(ctx, request, binding)
 	if err != nil || !decision.Allowed {
 		return ErrRejected
@@ -267,17 +286,29 @@ func (p *Plane) authorize(ctx context.Context, capability security.Capability, t
 	return nil
 }
 
-func (p *Plane) IssueConfirmation(ctx context.Context, class security.ConfirmationClass) (security.Confirmation, error) {
+func (p *Plane) IssueOperatorConfirmation(ctx context.Context, request security.OperatorConfirmationRequest) (security.Confirmation, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p == nil {
+	if p == nil || p.Operator == nil || request.Binding.RepositoryID != p.RepositoryID || request.Binding.PrincipalID != p.PrincipalID || request.Binding.SessionID != p.session.ID {
 		return security.Confirmation{}, ErrRejected
 	}
-	confirmation, err := p.Security.IssueConfirmation(ctx, p.session.ID, class, 10*time.Minute)
+	confirmation, err := p.Security.IssueOperatorConfirmation(ctx, p.Operator, request)
 	if err != nil {
 		return security.Confirmation{}, ErrRejected
 	}
 	return confirmation, nil
+}
+
+func (p *Plane) IntegrationConfirmationBinding(ctx context.Context, generationID string) (security.ConfirmationBinding, error) {
+	record, err := p.WorkspaceStatus(ctx, generationID)
+	if err != nil || !p.hasVerifiedCandidate(ctx, record) {
+		return security.ConfirmationBinding{}, ErrStale
+	}
+	plan, err := p.Repository.BuildIntegrationPlan(ctx, record.Generation, record.Lease)
+	if err != nil {
+		return security.ConfirmationBinding{}, ErrRejected
+	}
+	return security.ConfirmationBinding{Action: digestText("repository.integrate:" + plan.PlanDigest), RepositoryID: p.RepositoryID, PrincipalID: p.PrincipalID, SessionID: p.session.ID, GenerationID: generationID, FencingGeneration: record.Lease.FencingGeneration, CandidateSnapshot: record.Generation.CandidateSnapshot, PlanDigest: plan.PlanDigest}, nil
 }
 
 func (p *Plane) CreateWorkspace(ctx context.Context, taskID string) (WorkspaceRecord, error) {
@@ -312,8 +343,38 @@ func (p *Plane) WorkspaceStatus(ctx context.Context, generationID string) (Works
 	}
 	record, ok := p.workspaces[generationID]
 	if !ok {
+		// Rehydration is intentionally performed before any caller can mutate
+		// the generation. A new lease creates a new fencing epoch.
+		p.mu.Unlock()
+		rehydrated, rehydrateErr := p.ensureWorkspace(ctx, generationID)
+		p.mu.Lock()
+		if rehydrateErr != nil {
+			return WorkspaceRecord{}, ErrRejected
+		}
+		return rehydrated, nil
+	}
+	return record, nil
+}
+
+func (p *Plane) ensureWorkspace(ctx context.Context, generationID string) (WorkspaceRecord, error) {
+	p.mu.Lock()
+	if record, ok := p.workspaces[generationID]; ok {
+		p.mu.Unlock()
+		return record, nil
+	}
+	p.mu.Unlock()
+	generation, err := p.Repository.LoadGeneration(ctx, generationID)
+	if err != nil {
 		return WorkspaceRecord{}, ErrRejected
 	}
+	lease, err := p.Repository.AcquireLease(ctx, generationID, p.PrincipalID, 30*time.Minute)
+	if err != nil {
+		return WorkspaceRecord{}, ErrRejected
+	}
+	record := WorkspaceRecord{Generation: generation, Lease: lease}
+	p.mu.Lock()
+	p.workspaces[generationID] = record
+	p.mu.Unlock()
 	return record, nil
 }
 
@@ -355,11 +416,12 @@ func (p *Plane) Integrate(ctx context.Context, generationID, confirmation string
 	if !p.hasVerifiedCandidate(ctx, record) {
 		return workspace.IntegrationJournal{}, ErrStale
 	}
-	if err := p.authorize(ctx, security.CapabilityIntegrate, security.TargetLiveRepository, "", security.ExecutionSpec{}, confirmation, record.Generation); err != nil {
-		return workspace.IntegrationJournal{}, ErrRejected
-	}
 	plan, err := p.Repository.BuildIntegrationPlan(ctx, record.Generation, record.Lease)
 	if err != nil {
+		return workspace.IntegrationJournal{}, ErrRejected
+	}
+	binding := security.ConfirmationBinding{Action: digestText("repository.integrate:" + plan.PlanDigest), RepositoryID: p.RepositoryID, PrincipalID: p.PrincipalID, SessionID: p.session.ID, GenerationID: generationID, FencingGeneration: record.Lease.FencingGeneration, CandidateSnapshot: record.Generation.CandidateSnapshot, PlanDigest: plan.PlanDigest}
+	if err := p.authorizeWithBinding(ctx, security.CapabilityIntegrate, security.TargetLiveRepository, "", security.ExecutionSpec{}, confirmation, binding, record.Generation); err != nil {
 		return workspace.IntegrationJournal{}, ErrRejected
 	}
 	return p.Repository.ApplyIntegration(ctx, plan, record.Lease)

@@ -110,18 +110,68 @@ type RepositoryEnrollment struct {
 }
 
 type Session struct {
-	ID           string
-	PrincipalID  string
-	RepositoryID string
-	Nonce        string
-	ExpiresAt    time.Time
+	ID               string
+	PrincipalID      string
+	RepositoryID     string
+	TransportID      string
+	AuthenticationID string
+	Nonce            string
+	ExpiresAt        time.Time
 }
 
 type Confirmation struct {
 	Token     string
 	Class     ConfirmationClass
-	SessionID string
+	Binding   ConfirmationBinding
 	ExpiresAt time.Time
+}
+
+// ConfirmationBinding is the immutable scope a human operator approved.
+type ConfirmationBinding struct {
+	Action            string
+	RepositoryID      string
+	PrincipalID       string
+	SessionID         string
+	GenerationID      string
+	FencingGeneration uint64
+	CandidateSnapshot string
+	PlanDigest        string
+}
+
+type OperatorConfirmationRequest struct {
+	Binding ConfirmationBinding
+	Class   ConfirmationClass
+	TTL     time.Duration
+}
+
+// OperatorAuthority is deliberately separate from the autonomous MCP
+// surface. Implementations authenticate an operator through a local CLI,
+// private admin socket, or another explicitly protected channel.
+type OperatorAuthority interface {
+	AuthorizeOperator(context.Context, OperatorConfirmationRequest) error
+}
+
+// ExplicitOperatorAuthority is useful for a private local admin adapter and
+// tests. It is never installed by Open unless configured.
+type ExplicitOperatorAuthority struct {
+	OperatorID string
+}
+
+func NewExplicitOperatorAuthority(operatorID string) (ExplicitOperatorAuthority, error) {
+	if !validID(operatorID) {
+		return ExplicitOperatorAuthority{}, ErrDenied
+	}
+	return ExplicitOperatorAuthority{OperatorID: operatorID}, nil
+}
+
+func (a ExplicitOperatorAuthority) AuthorizeOperator(ctx context.Context, request OperatorConfirmationRequest) error {
+	if ctx == nil || !validID(a.OperatorID) || !validConfirmationBinding(request.Binding) || request.Binding.PrincipalID == a.OperatorID {
+		return ErrDenied
+	}
+	if request.Class != ConfirmationDestructive && request.Class != ConfirmationPublication {
+		return ErrDenied
+	}
+	return nil
 }
 
 type Request struct {
@@ -134,6 +184,7 @@ type Request struct {
 	Path                  string
 	TrustedIntegrationRef string
 	ConfirmationToken     string
+	ConfirmationBinding   ConfirmationBinding
 	Execution             ExecutionSpec
 }
 
@@ -228,10 +279,10 @@ func (e *Engine) EnrollRepository(ctx context.Context, principalID string, repos
 	return enrollment, ref, nil
 }
 
-func (e *Engine) OpenSession(ctx context.Context, principalID, repositoryID string, ttl time.Duration) (Session, error) {
+func (e *Engine) OpenAuthenticatedSession(ctx context.Context, principal Principal, repositoryID string, ttl time.Duration) (Session, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if ctx == nil || !validID(principalID) || !validIdentity(repositoryID) || ttl <= 0 || ttl > 24*time.Hour {
+	if ctx == nil || !validPrincipal(principal) || !validIdentity(repositoryID) || ttl <= 0 || ttl > 24*time.Hour {
 		return Session{}, ErrDenied
 	}
 	if _, ok := e.enrollments[repositoryID]; !ok {
@@ -245,28 +296,59 @@ func (e *Engine) OpenSession(ctx context.Context, principalID, repositoryID stri
 	if err != nil {
 		return Session{}, ErrDenied
 	}
-	session := Session{ID: id, PrincipalID: principalID, RepositoryID: repositoryID, Nonce: nonce, ExpiresAt: time.Now().UTC().Add(ttl)}
+	expiresAt := time.Now().UTC().Add(ttl)
+	if principal.ExpiresAt.Before(expiresAt) {
+		expiresAt = principal.ExpiresAt
+	}
+	session := Session{ID: id, PrincipalID: principal.ID, RepositoryID: repositoryID, TransportID: principal.TransportID, AuthenticationID: principal.AuthenticationID, Nonce: nonce, ExpiresAt: expiresAt}
 	e.sessions[id] = session
 	return session, nil
 }
 
-func (e *Engine) IssueConfirmation(ctx context.Context, sessionID string, class ConfirmationClass, ttl time.Duration) (Confirmation, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if ctx == nil || !validOpaque(sessionID) || (class != ConfirmationDestructive && class != ConfirmationPublication) || ttl <= 0 || ttl > time.Hour {
+func (e *Engine) IssueOperatorConfirmation(ctx context.Context, authority OperatorAuthority, request OperatorConfirmationRequest) (Confirmation, error) {
+	if authority == nil {
 		return Confirmation{}, ErrDenied
 	}
-	session, ok := e.sessions[sessionID]
+	if err := authority.AuthorizeOperator(ctx, request); err != nil {
+		return Confirmation{}, ErrDenied
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if ctx == nil || !validConfirmationBinding(request.Binding) || (request.Class != ConfirmationDestructive && request.Class != ConfirmationPublication) || request.TTL <= 0 || request.TTL > time.Hour {
+		return Confirmation{}, ErrDenied
+	}
+	session, ok := e.sessions[request.Binding.SessionID]
 	if !ok || !session.ExpiresAt.After(time.Now().UTC()) {
 		return Confirmation{}, ErrExpired
+	}
+	if session.PrincipalID != request.Binding.PrincipalID || session.RepositoryID != request.Binding.RepositoryID {
+		return Confirmation{}, ErrDenied
 	}
 	token, err := newOpaque("confirm_")
 	if err != nil {
 		return Confirmation{}, ErrDenied
 	}
-	confirmation := Confirmation{Token: token, Class: class, SessionID: sessionID, ExpiresAt: time.Now().UTC().Add(ttl)}
+	confirmation := Confirmation{Token: token, Class: request.Class, Binding: request.Binding, ExpiresAt: time.Now().UTC().Add(request.TTL)}
 	e.confirmations[token] = confirmation
 	return confirmation, nil
+}
+
+func (e *Engine) RevokeSession(ctx context.Context, sessionID string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if ctx == nil || !validOpaque(sessionID) {
+		return ErrDenied
+	}
+	if _, ok := e.sessions[sessionID]; !ok {
+		return ErrExpired
+	}
+	delete(e.sessions, sessionID)
+	for token, confirmation := range e.confirmations {
+		if confirmation.Binding.SessionID == sessionID {
+			delete(e.confirmations, token)
+		}
+	}
+	return nil
 }
 
 func (e *Engine) Authorize(ctx context.Context, request Request, binding Binding) (Decision, error) {
@@ -312,7 +394,7 @@ func (e *Engine) Authorize(ctx context.Context, request Request, binding Binding
 		return deny(ErrDenied, "target denied")
 	}
 	if class := requiredConfirmation(request.Capability); class != ConfirmationNone {
-		if err := e.consumeConfirmationLocked(request.SessionID, request.ConfirmationToken, class); err != nil {
+		if err := e.consumeConfirmationLocked(request.SessionID, request.ConfirmationToken, class, request.ConfirmationBinding); err != nil {
 			return deny(ErrDenied, "confirmation denied")
 		}
 	}
@@ -471,13 +553,26 @@ func requiredConfirmation(capability Capability) ConfirmationClass {
 	}
 }
 
-func (e *Engine) consumeConfirmationLocked(sessionID, token string, class ConfirmationClass) error {
+func (e *Engine) consumeConfirmationLocked(sessionID, token string, class ConfirmationClass, binding ConfirmationBinding) error {
 	confirmation, ok := e.confirmations[token]
-	if !ok || confirmation.SessionID != sessionID || confirmation.Class != class || !confirmation.ExpiresAt.After(time.Now().UTC()) {
+	if !ok || confirmation.Binding.SessionID != sessionID || confirmation.Class != class || !confirmation.ExpiresAt.After(time.Now().UTC()) || confirmation.Binding != binding {
+		if ok {
+			// A scope mismatch invalidates the record; it cannot be widened or
+			// retried for a different action.
+			delete(e.confirmations, token)
+		}
 		return ErrDenied
 	}
 	delete(e.confirmations, token)
 	return nil
+}
+
+func validPrincipal(principal Principal) bool {
+	return validID(principal.ID) && validOpaque(principal.TransportID) && validIdentity(principal.AuthenticationID) && !principal.ExpiresAt.IsZero() && principal.ExpiresAt.After(time.Now().UTC())
+}
+
+func validConfirmationBinding(binding ConfirmationBinding) bool {
+	return validOpaque(binding.Action) && validIdentity(binding.RepositoryID) && validID(binding.PrincipalID) && validOpaque(binding.SessionID) && validOpaque(binding.GenerationID) && binding.FencingGeneration > 0 && validIdentity(binding.CandidateSnapshot) && validIdentity(binding.PlanDigest)
 }
 
 func (e *Engine) validateTrustedRefLocked(repositoryID, ref string) error {

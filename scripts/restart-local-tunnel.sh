@@ -47,7 +47,7 @@ fi
 
 # Override only the MCP command so the profile's credentials and tunnel
 # identity remain unchanged while RepoWorker uses a fresh, explicit state root.
-mcp_command="channel=main,command=$repo_root/bin/repoworker -repo-root $repo_root -state-dir $state_root"
+mcp_command="channel=main,command=$repo_root/bin/repoworker -repo-root $repo_root -state-dir $state_root -trusted-principal local-tunnel"
 nohup tunnel-client run --profile "$profile" --mcp.command "$mcp_command" >>"$log_file" 2>&1 &
 new_pid=$!
 print "tunnel-client restarted (pid $new_pid)"

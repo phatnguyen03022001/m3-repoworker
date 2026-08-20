@@ -124,6 +124,93 @@ func TestRuntimeRecoveryStopsPersistedActiveRuntime(t *testing.T) {
 	}
 }
 
+func TestStoppedRuntimeIsRecreatedForFreshLeaseAfterRestart(t *testing.T) {
+	repository, generation, lease, spec, runtimeState := testRuntimeFixture(t)
+	defer repository.Close()
+	adapter := &FakeAdapter{BackendName: "test"}
+	manager, err := NewManager(repository, runtimeState, adapter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ReserveRuntime(context.Background(), lease, "task-a"); err != nil {
+		t.Fatal(err)
+	}
+	created, err := manager.Create(context.Background(), spec, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Start(context.Background(), generation.ID, lease); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Stop(context.Background(), generation.ID, lease); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ReleaseRuntime(context.Background(), lease, "task-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ReleaseLease(context.Background(), lease); err != nil {
+		t.Fatal(err)
+	}
+	freshLease, err := repository.AcquireLease(context.Background(), generation.ID, "task-a", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshSpec := spec
+	freshSpec.Lease = freshLease
+	recreated, err := manager.Create(context.Background(), freshSpec, "test")
+	if err != nil {
+		t.Fatalf("Create(recreated) error = %v", err)
+	}
+	if recreated.ID == created.ID || recreated.LeaseGeneration != freshLease.FencingGeneration || recreated.State != StateReady {
+		t.Fatalf("recreated runtime = %#v, old=%#v lease=%#v", recreated, created, freshLease)
+	}
+}
+
+func TestRuntimeRecreationFailureDoesNotManufactureReadyState(t *testing.T) {
+	repository, generation, lease, spec, runtimeState := testRuntimeFixture(t)
+	defer repository.Close()
+	adapter := &FakeAdapter{BackendName: "test"}
+	manager, err := NewManager(repository, runtimeState, adapter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ReserveRuntime(context.Background(), lease, "task-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Create(context.Background(), spec, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Start(context.Background(), generation.ID, lease); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Stop(context.Background(), generation.ID, lease); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ReleaseRuntime(context.Background(), lease, "task-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ReleaseLease(context.Background(), lease); err != nil {
+		t.Fatal(err)
+	}
+	freshLease, err := repository.AcquireLease(context.Background(), generation.ID, "task-a", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter.Err = errors.New("backend unavailable")
+	freshSpec := spec
+	freshSpec.Lease = freshLease
+	if _, err := manager.Create(context.Background(), freshSpec, "test"); !errors.Is(err, ErrRejected) {
+		t.Fatalf("Create(failed recreation) error = %v, want rejection", err)
+	}
+	record, err := manager.Status(context.Background(), generation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.State != StateQuarantined {
+		t.Fatalf("failed recreation state = %s, want QUARANTINED", record.State)
+	}
+}
+
 type recordingRunner struct {
 	Args []string
 }

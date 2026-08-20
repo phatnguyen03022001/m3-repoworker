@@ -40,6 +40,7 @@ var (
 type Repository struct {
 	root           string
 	rootFD         *os.File
+	stateLock      *os.File
 	rootIdentity   string
 	filesystemID   string
 	workspaceRoot  string
@@ -108,9 +109,19 @@ func OpenRepository(root, stateRoot string) (*Repository, error) {
 		_ = unix.Close(rootFD)
 		return nil, ErrRejected
 	}
+	lockPath := filepath.Join(canonicalState, rootIdentity+".lock")
+	stateLock, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE|unix.O_CLOEXEC, 0o600)
+	if err != nil || unix.Flock(int(stateLock.Fd()), unix.LOCK_EX|unix.LOCK_NB) != nil {
+		if stateLock != nil {
+			_ = stateLock.Close()
+		}
+		_ = unix.Close(rootFD)
+		return nil, ErrRejected
+	}
 	repository := &Repository{
 		root:          canonicalRoot,
 		rootFD:        os.NewFile(uintptr(rootFD), canonicalRoot),
+		stateLock:     stateLock,
 		rootIdentity:  rootIdentity,
 		filesystemID:  filesystemID,
 		workspaceRoot: workspaceRoot,
@@ -118,6 +129,8 @@ func OpenRepository(root, stateRoot string) (*Repository, error) {
 	}
 	if repository.rootFD == nil || repository.recoverJournals(context.Background()) != nil {
 		_ = unix.Close(rootFD)
+		_ = unix.Flock(int(stateLock.Fd()), unix.LOCK_UN)
+		_ = stateLock.Close()
 		return nil, ErrRejected
 	}
 	return repository, nil
@@ -128,6 +141,110 @@ func (r *Repository) RootIdentity() string { return r.rootIdentity }
 func (r *Repository) SourceFilesystemIdentity() string { return r.filesystemID }
 
 func (r *Repository) LiveRoot() string { return r.root }
+
+// LoadGeneration revalidates a persisted generation against the opened live
+// repository authority. It is used by startup recovery and loop resume.
+func (r *Repository) LoadGeneration(ctx context.Context, generationID string) (Generation, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if ctx == nil || r == nil || r.rootFD == nil {
+		return Generation{}, ErrRejected
+	}
+	return r.loadGeneration(generationID)
+}
+
+// CurrentLease returns the persisted lease for recovery validation without
+// granting ownership.
+func (r *Repository) CurrentLease(ctx context.Context, generationID string) (Lease, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if ctx == nil || r == nil || r.rootFD == nil {
+		return Lease{}, ErrRejected
+	}
+	generation, err := r.loadGeneration(generationID)
+	if err != nil {
+		return Lease{}, err
+	}
+	var current leaseFile
+	if err := readJSON(filepath.Join(generation.Path, ".lease.json"), &current); err != nil || current.Lease.GenerationID != generationID || !validOwner(current.Lease.Owner) || current.Lease.FencingGeneration == 0 || current.Lease.ExpiresAt.IsZero() {
+		return Lease{}, ErrRejected
+	}
+	return current.Lease, nil
+}
+
+// Recover removes old process ownership after runtime recovery. It validates
+// every generation before making a stale lease reusable; ambiguous records are
+// moved to a private quarantine directory and cannot be mutated.
+func (r *Repository) Recover(ctx context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if ctx == nil || r == nil || r.rootFD == nil {
+		return ErrRejected
+	}
+	entries, err := os.ReadDir(r.workspaceRoot)
+	if err != nil {
+		return ErrRejected
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), ".tmp-") {
+			if quarantineErr := r.quarantineGeneration(entry.Name()); quarantineErr != nil {
+				return ErrRejected
+			}
+			continue
+		}
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "gen_") {
+			continue
+		}
+		generation, err := r.loadGeneration(entry.Name())
+		if err != nil {
+			if quarantineErr := r.quarantineGeneration(entry.Name()); quarantineErr != nil {
+				return ErrRejected
+			}
+			continue
+		}
+		leasePath := filepath.Join(generation.Path, ".lease.json")
+		var lease leaseFile
+		if err := readJSON(leasePath, &lease); err == nil {
+			if lease.Lease.GenerationID != generation.ID || !validOwner(lease.Lease.Owner) || lease.Lease.FencingGeneration == 0 || lease.Lease.ExpiresAt.IsZero() {
+				if quarantineErr := r.quarantineGeneration(generation.ID); quarantineErr != nil {
+					return ErrRejected
+				}
+				continue
+			}
+			if err := os.Remove(leasePath); err != nil {
+				return ErrRejected
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			if quarantineErr := r.quarantineGeneration(generation.ID); quarantineErr != nil {
+				return ErrRejected
+			}
+			continue
+		}
+		if err := os.Remove(filepath.Join(generation.Path, ".runtime-owner.json")); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return ErrRejected
+		}
+		if err := syncDirectory(generation.Path); err != nil {
+			return ErrRejected
+		}
+	}
+	return syncDirectory(r.workspaceRoot)
+}
+
+func (r *Repository) quarantineGeneration(id string) error {
+	path := filepath.Join(r.workspaceRoot, id)
+	quarantineRoot := filepath.Join(r.workspaceRoot, "quarantine")
+	if err := os.MkdirAll(quarantineRoot, 0o700); err != nil {
+		return err
+	}
+	quarantinePath := filepath.Join(quarantineRoot, id+"-"+strconv.FormatInt(time.Now().UTC().UnixNano(), 10))
+	if err := os.Rename(path, quarantinePath); err != nil {
+		return err
+	}
+	return syncDirectory(r.workspaceRoot)
+}
 
 // SnapshotPath computes the same candidate snapshot used by generation
 // materialization and refresh. It is read-only and uses the shared walker.
@@ -147,6 +264,11 @@ func (r *Repository) Close() error {
 	}
 	err := r.rootFD.Close()
 	r.rootFD = nil
+	if r.stateLock != nil {
+		_ = unix.Flock(int(r.stateLock.Fd()), unix.LOCK_UN)
+		_ = r.stateLock.Close()
+		r.stateLock = nil
+	}
 	return err
 }
 
@@ -219,7 +341,12 @@ func (r *Repository) loadGeneration(id string) (Generation, error) {
 		generation.SourceFilesystem != r.filesystemID || generation.State != activeState || generation.CandidateSnapshot == "" {
 		return Generation{}, ErrRejected
 	}
-	if info, err := os.Stat(path); err != nil || !info.IsDir() || pathWithin(r.root, path) {
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || pathWithin(r.root, path) {
+		return Generation{}, ErrRejected
+	}
+	canonicalPath, err := filepath.EvalSymlinks(path)
+	if err != nil || filepath.Clean(canonicalPath) != path {
 		return Generation{}, ErrRejected
 	}
 	return generation, nil

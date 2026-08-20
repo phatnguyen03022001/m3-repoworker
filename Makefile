@@ -5,7 +5,7 @@ BIN_DIR ?= bin
 GO_ENV = GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) GOPATH=$(GOPATH)
 INTERNAL_GUARD = env -u M3_REPOWORKER_INTERNAL_FIXED_PRESET -u REPOWORKER_RUN_PRESET_SEQUENCE
 
-.PHONY: bootstrap build fmt-check test test-race mcp-integration vet mod-verify offline-verify lima ci verify
+.PHONY: bootstrap build fmt-check test test-race mcp-integration vet mod-verify offline-verify lima real-gate ci verify
 
 bootstrap:
 	mkdir -p $(GOMODCACHE)
@@ -19,10 +19,10 @@ fmt-check:
 	test -z "$(shell gofmt -l $$(find cmd internal -name '*.go' -print))"
 
 test:
-	$(INTERNAL_GUARD) $(GO_ENV) go test ./...
+	$(INTERNAL_GUARD) $(GO_ENV) go test ./... -skip 'TestAppleContainerRealLifecycle|TestControlPlaneRealM3EndToEnd'
 
 test-race:
-	$(INTERNAL_GUARD) $(GO_ENV) go test -race ./...
+	$(INTERNAL_GUARD) $(GO_ENV) go test -race ./... -skip 'TestAppleContainerRealLifecycle|TestControlPlaneRealM3EndToEnd'
 
 mcp-integration:
 	$(INTERNAL_GUARD) $(GO_ENV) go test ./cmd/repoworker -run '^Test(MCP((Repository|Task)ToolsAndSanitizedRejection|VerificationReturnsBoundedSanitizedDiagnostic)|ProductionMCPToolSurface)$$' -count=1
@@ -34,11 +34,19 @@ mod-verify:
 	$(INTERNAL_GUARD) $(GO_ENV) go mod verify
 
 offline-verify:
-	GOPROXY=off GOSUMDB=off $(MAKE) GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) GOPATH=$(GOPATH) verify
+	GOPROXY=off GOSUMDB=off $(MAKE) GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) GOPATH=$(GOPATH) ci lima
 
 lima:
 	limactl validate repoworker-prod.yaml
 
 ci: fmt-check vet test test-race mcp-integration mod-verify build
 
-verify: ci lima
+real-gate:
+	@echo "real Apple lifecycle gate: RUN"
+	$(INTERNAL_GUARD) $(GO_ENV) go test ./internal/runtime -run '^TestAppleContainerRealLifecycle$$' -count=1 -v
+	@echo "real Apple lifecycle gate: PASS"
+	@echo "real M3 E2E gate: RUN"
+	REPOWORKER_REAL_E2E=1 $(INTERNAL_GUARD) $(GO_ENV) go test ./internal/controlplane -run '^TestControlPlaneRealM3EndToEnd$$' -count=1 -v
+	@echo "real M3 E2E gate: PASS"
+
+verify: ci lima real-gate

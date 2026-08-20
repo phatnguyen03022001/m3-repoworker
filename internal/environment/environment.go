@@ -166,7 +166,11 @@ func NewManager(root string, cache *Cache, installer Installer) (*Manager, error
 	if err := os.MkdirAll(root, 0o700); err != nil || os.Chmod(root, 0o700) != nil {
 		return nil, ErrRejected
 	}
-	return &Manager{root: root, cache: cache, installer: installer, gens: map[string]Generation{}}, nil
+	manager := &Manager{root: root, cache: cache, installer: installer, gens: map[string]Generation{}}
+	if err := manager.load(); err != nil {
+		return nil, ErrRejected
+	}
+	return manager, nil
 }
 
 func (m *Manager) Create(ctx context.Context, spec EnvironmentSpec) (Generation, error) {
@@ -175,16 +179,50 @@ func (m *Manager) Create(ctx context.Context, spec EnvironmentSpec) (Generation,
 	if ctx == nil || !validSpec(spec) {
 		return Generation{}, ErrRejected
 	}
-	id := "env_" + digestString(spec.RepositoryID + "\x00" + spec.WorkspaceID + "\x00" + time.Now().UTC().Format(time.RFC3339Nano))[:32]
-	generation := Generation{ID: id, Identity: environmentIdentity(spec), Spec: spec, State: "READY", CreatedAt: time.Now().UTC()}
-	if _, exists := m.gens[id]; exists {
+	identity := environmentIdentity(spec)
+	id := "env_" + identity[:32]
+	if existing, exists := m.gens[id]; exists {
+		if existing.Identity == identity && existing.Spec == spec && existing.State == "READY" {
+			return existing, nil
+		}
 		return Generation{}, ErrRejected
 	}
+	generation := Generation{ID: id, Identity: identity, Spec: spec, State: "READY", CreatedAt: time.Now().UTC()}
 	if err := writeJSON(filepath.Join(m.root, id+".json"), generation); err != nil {
 		return Generation{}, ErrRejected
 	}
 	m.gens[id] = generation
 	return generation, nil
+}
+
+func (m *Manager) load() error {
+	entries, err := os.ReadDir(m.root)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		file, err := os.Open(filepath.Join(m.root, entry.Name()))
+		if err != nil {
+			return err
+		}
+		var generation Generation
+		decoder := json.NewDecoder(io.LimitReader(file, 64<<10))
+		decoder.DisallowUnknownFields()
+		err = decoder.Decode(&generation)
+		_ = file.Close()
+		if err != nil || !validGeneration(generation) || entry.Name() != generation.ID+".json" || generation.Identity != environmentIdentity(generation.Spec) {
+			return ErrRejected
+		}
+		m.gens[generation.ID] = generation
+	}
+	return nil
+}
+
+func validGeneration(generation Generation) bool {
+	return validOpaque(generation.ID) && strings.HasPrefix(generation.ID, "env_") && validIdentity(generation.Identity) && validSpec(generation.Spec) && generation.State == "READY" && !generation.CreatedAt.IsZero()
 }
 
 func (m *Manager) Install(ctx context.Context, generation Generation, packages []string, policy security.CompiledPolicy) error {

@@ -19,6 +19,8 @@ events/checkpoints → autonomous loop → optional verified publication`.
 - Publication is plan-first and execute requires fresh verification, rechecks,
   and scoped confirmation.
 - Secrets are rejected from environment and durable event/output boundaries.
+- Authentication is transport-bound and fail-closed; operator confirmation is
+  outside the autonomous MCP surface.
 
 ## Definition of done
 
@@ -30,4 +32,6 @@ events/checkpoints → autonomous loop → optional verified publication`.
   → publication plan → authorized integration.
 - Cold-cache bootstrap followed by offline verification passes in a private
   cache root.
+- The exact production MCP surface is closed-world and includes typed
+  `repo_git_status` without `confirmation_issue`.
 - README and operational docs describe the actual commands and limitations.

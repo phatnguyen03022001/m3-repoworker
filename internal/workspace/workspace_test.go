@@ -145,6 +145,123 @@ func TestExpiredLeaseQuarantinesGeneration(t *testing.T) {
 	}
 }
 
+func TestCloseOpenRecoveryRehydratesGenerationAndAdvancesFence(t *testing.T) {
+	repoRoot := t.TempDir()
+	stateRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.txt"), []byte("source\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	firstRepository, err := OpenRepository(repoRoot, stateRoot)
+	if err != nil {
+		t.Fatalf("OpenRepository(first) error = %v", err)
+	}
+	generation, err := firstRepository.Materialize(context.Background())
+	if err != nil {
+		t.Fatalf("Materialize() error = %v", err)
+	}
+	firstLease, err := firstRepository.AcquireLease(context.Background(), generation.ID, "caller-a", time.Minute)
+	if err != nil {
+		t.Fatalf("AcquireLease(first) error = %v", err)
+	}
+	if err := firstRepository.Close(); err != nil {
+		t.Fatalf("Close(first) error = %v", err)
+	}
+
+	restarted, err := OpenRepository(repoRoot, stateRoot)
+	if err != nil {
+		t.Fatalf("OpenRepository(restart) error = %v", err)
+	}
+	defer restarted.Close()
+	if err := restarted.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	rehydrated, err := restarted.LoadGeneration(context.Background(), generation.ID)
+	if err != nil || rehydrated != generation {
+		t.Fatalf("LoadGeneration() = %#v, %v; want %#v", rehydrated, err, generation)
+	}
+	secondLease, err := restarted.AcquireLease(context.Background(), generation.ID, "caller-b", time.Minute)
+	if err != nil {
+		t.Fatalf("AcquireLease(second) error = %v", err)
+	}
+	if secondLease.FencingGeneration <= firstLease.FencingGeneration {
+		t.Fatalf("recovery did not advance fence: first=%d second=%d", firstLease.FencingGeneration, secondLease.FencingGeneration)
+	}
+	if err := restarted.AssertLease(context.Background(), firstLease); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("old lease assertion error = %v, want stale fence", err)
+	}
+}
+
+func TestRecoverQuarantinesCorruptedGenerationRecord(t *testing.T) {
+	repoRoot := t.TempDir()
+	stateRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.txt"), []byte("source\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := OpenRepository(repoRoot, stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation, err := repository.Materialize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(generation.Path, ".generation.json"), []byte("{corrupt\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := OpenRepository(repoRoot, stateRoot)
+	if err != nil {
+		t.Fatalf("OpenRepository(restart) error = %v", err)
+	}
+	defer restarted.Close()
+	if err := restarted.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if _, err := restarted.LoadGeneration(context.Background(), generation.ID); !errors.Is(err, ErrRejected) {
+		t.Fatalf("LoadGeneration(corrupt) error = %v, want rejection", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(restarted.workspaceRoot, "quarantine"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("quarantine entries = %d, %v; want one record", len(entries), err)
+	}
+}
+
+func TestRecoverQuarantinesInterruptedTemporaryGeneration(t *testing.T) {
+	repoRoot := t.TempDir()
+	stateRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.txt"), []byte("source\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := OpenRepository(repoRoot, stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporary := filepath.Join(repository.workspaceRoot, ".tmp-gen_interrupted")
+	if err := os.Mkdir(temporary, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := OpenRepository(repoRoot, stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	if err := restarted.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if _, err := os.Stat(temporary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary generation still present: %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(restarted.workspaceRoot, "quarantine"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("quarantine entries = %d, %v; want one temporary record", len(entries), err)
+	}
+}
+
 func TestMaterializeRejectsSymlinkEscape(t *testing.T) {
 	t.Parallel()
 

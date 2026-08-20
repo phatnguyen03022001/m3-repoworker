@@ -69,6 +69,37 @@ func TestEnvironmentGenerationAndRegistryOnlyInstall(t *testing.T) {
 	}
 }
 
+func TestEnvironmentGenerationRehydratesWithStableIdentity(t *testing.T) {
+	root := t.TempDir()
+	cache, err := NewCache(filepath.Join(root, "cache"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := EnvironmentSpec{RepositoryID: strings.Repeat("a", 64), WorkspaceID: "gen_1", Platform: "darwin/arm64", Toolchain: Toolchain{Kind: ToolchainGo, Version: "1.26.6", Identity: strings.Repeat("b", 64)}, LockfileDigest: strings.Repeat("c", 64), PolicyVersion: "m3.2-v1", Image: "go:1.26"}
+	first, err := NewManager(filepath.Join(root, "environments"), cache, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation, err := first.Create(context.Background(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewManager(filepath.Join(root, "environments"), cache, nil)
+	if err != nil {
+		t.Fatalf("NewManager(restart) error = %v", err)
+	}
+	rehydrated, err := restarted.Create(context.Background(), spec)
+	if err != nil || rehydrated != generation {
+		t.Fatalf("Create(restart) = %#v, %v; want %#v", rehydrated, err, generation)
+	}
+	changed := spec
+	changed.Image = "go:1.27"
+	changedGeneration, err := restarted.Create(context.Background(), changed)
+	if err != nil || changedGeneration.Identity == generation.Identity {
+		t.Fatalf("Create(changed) = %#v, %v; want a new binding", changedGeneration, err)
+	}
+}
+
 func TestCacheColdWarmEquivalenceAndPoisoningRejection(t *testing.T) {
 	root := t.TempDir()
 	cache, err := NewCache(root)

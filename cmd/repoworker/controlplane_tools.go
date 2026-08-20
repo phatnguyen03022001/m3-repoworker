@@ -12,7 +12,6 @@ import (
 	"github.com/tienphat/m3-repoworker/internal/publication"
 	"github.com/tienphat/m3-repoworker/internal/repo"
 	m3runtime "github.com/tienphat/m3-repoworker/internal/runtime"
-	"github.com/tienphat/m3-repoworker/internal/security"
 	"github.com/tienphat/m3-repoworker/internal/verify"
 	"github.com/tienphat/m3-repoworker/internal/workspace"
 )
@@ -94,10 +93,6 @@ type EventListInput struct {
 	RunID string `json:"run_id"`
 	After int64  `json:"after,omitempty"`
 	Limit int    `json:"limit,omitempty"`
-}
-
-type ConfirmationIssueInput struct {
-	Class string `json:"class" jsonschema:"destructive or publication"`
 }
 
 // MCP output types deliberately omit host paths, spill files, and container
@@ -224,6 +219,13 @@ func newControlPlaneServer(plane *controlplane.Plane) *mcp.Server {
 	// authority in a TaskWorkspace generation.
 	mcp.AddTool(server, m3Tool("repo_status", "Repository status", "Return authenticated control-plane and repository health.", true, true, false, false), func(_ context.Context, _ *mcp.CallToolRequest, _ StatusInput) (*mcp.CallToolResult, StatusOutput, error) {
 		return nil, StatusOutput{Status: "ok"}, nil
+	})
+	mcp.AddTool(server, m3Tool("repo_git_status", "Read Git status", "Return typed read-only Git status bound to the opened repository authority.", true, true, false, false), func(ctx context.Context, _ *mcp.CallToolRequest, _ RepoSnapshotInput) (*mcp.CallToolResult, repo.GitStatus, error) {
+		status, err := plane.Repo.GitStatus(ctx)
+		if err != nil {
+			return nil, repo.GitStatus{}, safeToolError(err)
+		}
+		return nil, status, nil
 	})
 	mcp.AddTool(server, m3Tool("repo_read", "Read repository file", "Read one permitted UTF-8 file from the live repository without mutation.", true, true, false, false), func(_ context.Context, _ *mcp.CallToolRequest, input RepoReadInput) (*mcp.CallToolResult, RepoReadOutput, error) {
 		path, content, err := plane.Repo.Read(input.Path)
@@ -453,27 +455,5 @@ func newControlPlaneServer(plane *controlplane.Plane) *mcp.Server {
 		return nil, result, nil
 	})
 
-	mcp.AddTool(server, m3Tool("confirmation_issue", "Issue confirmation", "Issue a scoped one-time confirmation token for a destructive or publication capability.", false, false, false, false), func(ctx context.Context, _ *mcp.CallToolRequest, input ConfirmationIssueInput) (*mcp.CallToolResult, any, error) {
-		confirmationClass, ok := parseConfirmationClass(input.Class)
-		if !ok {
-			return nil, nil, errRequestRejected
-		}
-		confirmation, err := plane.IssueConfirmation(ctx, confirmationClass)
-		if err != nil {
-			return nil, nil, safeToolError(err)
-		}
-		return nil, confirmation, nil
-	})
-
 	return server
-}
-
-func parseConfirmationClass(value string) (security.ConfirmationClass, bool) {
-	class := security.ConfirmationClass(value)
-	switch class {
-	case security.ConfirmationDestructive, security.ConfirmationPublication:
-		return class, true
-	default:
-		return "", false
-	}
 }

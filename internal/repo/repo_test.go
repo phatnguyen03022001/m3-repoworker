@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -52,6 +53,62 @@ func TestCapabilityFDsAreCloseOnExec(t *testing.T) {
 		if flags&unix.FD_CLOEXEC == 0 {
 			t.Fatalf("fd %d missing FD_CLOEXEC", fd)
 		}
+	}
+}
+
+func TestGitStatusIsTypedDeterministicAndReadOnly(t *testing.T) {
+	root := t.TempDir()
+	for _, args := range [][]string{{"init", "-b", "main"}, {"config", "user.name", "RepoWorker Test"}, {"config", "user.email", "repoworker@example.invalid"}, {"commit", "--allow-empty", "-m", "initial"}} {
+		command := exec.Command("git", append([]string{"-C", root}, args...)...)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+	workspace, err := New(root)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer workspace.Close()
+	clean, err := workspace.GitStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GitStatus(clean) error = %v", err)
+	}
+	if clean.Branch != "main" || len(clean.Head) != 40 || clean.Dirty || len(clean.ChangedPaths) != 0 || clean.RepositoryIdentity == "" || clean.TrustedRoot != clean.RepositoryIdentity {
+		t.Fatalf("clean GitStatus() = %#v", clean)
+	}
+	if err := os.WriteFile(filepath.Join(root, "z.txt"), []byte("z\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dirty, err := workspace.GitStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GitStatus(dirty) error = %v", err)
+	}
+	if !dirty.Dirty || strings.Join(dirty.ChangedPaths, ",") != "?? a.txt,?? z.txt" {
+		t.Fatalf("dirty GitStatus() = %#v, want deterministic changed paths", dirty)
+	}
+}
+
+func TestGitStatusFailsClosedForDetachedHead(t *testing.T) {
+	root := t.TempDir()
+	for _, args := range [][]string{{"init", "-b", "main"}, {"config", "user.name", "RepoWorker Test"}, {"config", "user.email", "repoworker@example.invalid"}, {"commit", "--allow-empty", "-m", "initial"}} {
+		command := exec.Command("git", append([]string{"-C", root}, args...)...)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+	workspace, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer workspace.Close()
+	if output, err := exec.Command("git", "-C", root, "checkout", "--detach", "HEAD").CombinedOutput(); err != nil {
+		t.Fatalf("detach: %v: %s", err, output)
+	}
+	if _, err := workspace.GitStatus(context.Background()); !errors.Is(err, ErrRejected) {
+		t.Fatalf("GitStatus(detached) error = %v, want rejection", err)
 	}
 }
 

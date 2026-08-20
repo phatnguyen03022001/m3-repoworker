@@ -19,11 +19,11 @@ import (
 func TestAppleContainerRealLifecycle(t *testing.T) {
 	binary, err := exec.LookPath("container")
 	if err != nil {
-		t.Skip("Apple container prerequisite missing: install/container CLI is unavailable")
+		t.Fatalf("NOT RUN: Apple container prerequisite missing: install/container CLI is unavailable")
 	}
 	machineOutput, err := exec.Command(binary, "machine", "list").CombinedOutput()
 	if err != nil || !strings.Contains(string(machineOutput), "running") {
-		t.Skip("Apple container prerequisite missing: run `container machine create --name repoworker alpine:3.22` and retry")
+		t.Fatalf("NOT RUN: Apple container machine is unavailable: run `container machine create --name repoworker alpine:3.22` and retry (output: %s)", machineOutput)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
