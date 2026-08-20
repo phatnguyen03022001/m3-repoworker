@@ -23,6 +23,9 @@ The current M3.1 substrate consists of:
   cleanup.
 - `internal/scheduler`: bounded DAG scheduler with CPU/RAM admission, weighted
   fairness, quotas, backpressure, cancellation, and host-pressure response.
+- `internal/environment`: deterministic toolchain/lockfile identities,
+  environment generations, registry-only installer boundary, and verified
+  non-authoritative cache.
 
 M3.2–M3.10 will bind authenticated principals, capabilities, process/runtime
 backends, resource admission, verification, events, autonomous-loop state,

@@ -91,3 +91,19 @@
   phases, and cache poisoning/cold-cache equivalence protection.
 - Exact next action: define environment and cache identities bound to
   toolchain/platform/lockfile/policy, then add cold/warm/corrupt-cache tests.
+
+## M3.6 — IN PROGRESS
+
+- State: reproducible environment and cache layer implemented locally;
+  verification and checkpoint pending.
+- Scope: deterministic Go/Node/Rust/Nx/Turbo/Bazel manifest detection,
+  lockfile hashing, environment generations, registry-only installer boundary,
+  cache provenance/content verification, poisoning rejection, and cold-cache
+  correctness path.
+- Tests: environment tests cover deterministic detection/hash, registry-only
+  install, cold/warm equivalence, policy-bound cache keys, corruption, cache
+  deletion, and symlink manifests.
+- Decisions: see `docs/adr/0006-m3.6-reproducible-environments.md`.
+- Remaining: run full verification and checkpoint on `main`.
+- Exact next action: run `make verify`, `govulncheck ./...`, inspect the diff,
+  and commit `m3.6: reproducible environments and cache`.
