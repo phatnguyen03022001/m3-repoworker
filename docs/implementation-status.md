@@ -146,10 +146,11 @@
   failure taxonomy, then add fake-model crash/resume and retry-convergence
   tests.
 
-## M3.9 — IN PROGRESS
+## M3.9 — GREEN
 
-- State: fixed typed autonomous coding loop implemented; awaiting full
-  repository verification and local checkpoint on `main`.
+- State: fixed typed autonomous coding loop implemented and checkpointed on
+  local `main`.
+- Commit: `6b97b18` (`m3.9: autonomous coding loop`).
 - Scope: persisted inspect/hypothesis/plan/parallel-command/patch/targeted
   test/diagnose/full-verify/checkpoint phases, bounded retries, failure
   taxonomy, action-fingerprint convergence, snapshot/environment/policy
@@ -158,8 +159,9 @@
   crash/resume, retry convergence, destructive-plan human checkpoint, and
   binding rejection.
 - Decisions: see `docs/adr/0009-m3.9-autonomous-loop.md`.
-- Remaining: full verification, checkpoint M3.9, then implement M3.10
-  disabled-by-default publication adapters with dry-run and explicit
-  confirmation.
-- Exact next action: run `make verify` and `govulncheck`, checkpoint M3.9, and
-  begin verified local/publication adapters.
+- Verification: `make verify` and `GOCACHE=.cache/go-build govulncheck ./...`
+  are green; Lima validation is OK with host-only detection warnings.
+- Remaining: M3.10 disabled-by-default publication adapters with dry-run and
+  explicit confirmation.
+- Exact next action: define the publication authority and adapters, then add
+  local bare-remote, fake-CLI, dry-run, and authorization tests.
