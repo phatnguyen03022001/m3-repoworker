@@ -33,10 +33,19 @@ make offline-verify
 ./scripts/cold-cache-verify.sh
 ```
 
+Provision the development image used when `runtime_create` receives no
+explicit image. This is a local operator setup step; it does not expose host
+shell execution to MCP:
+
+```sh
+./scripts/build-development-image.sh
+```
+
 Real Apple tests require a running machine:
 
 ```sh
 container machine create --name repoworker alpine:3.22
+./scripts/build-development-image.sh
 go test ./internal/runtime \
   -run TestAppleContainerRealLifecycle -count=1 -v
 REPOWORKER_REAL_E2E=1 go test ./internal/controlplane \
@@ -118,11 +127,22 @@ The runtime PATH is deterministic and includes `/workspace/node_modules/.bin`,
 must be bounded non-secret `NAME=value` entries; host environment, keychain,
 brew, sudo, host pip, and host npm-global state are not forwarded. The
 candidate workspace may contain local Git operations, but the live checkout is
-never mounted and authenticated push remains outside this capability.
+never mounted and authenticated push remains outside this capability. Each
+candidate starts with fresh local Git metadata and a synthetic base commit;
+the live `.git` directory is never copied, and candidate `.git` is excluded
+from snapshots and integration plans.
 
 Network mode is `none` by default. `registry` and `full` requests are rejected
 until an Apple adapter can enforce domain filtering; RepoWorker does not widen
 network access as a substitute.
+
+The default runtime image is the locally built `repoworker-dev:local` image.
+It contains Git, Go 1.26.6, Python/pip, Node/npm, make, bash/zsh, and
+Rust/cargo tooling, and preloads this repository's Go modules. A caller that
+selects another image must provision its own tools and dependencies; a missing
+executable is reported as the bounded process failure it is. The image build
+does not mount the live checkout into any runtime and does not forward host
+credentials.
 
 The MCP receiving boundary derives the private SDK `_meta` replay keys from
 the actual JSON-RPC request ID and canonical `tools/call` payload. Callers do

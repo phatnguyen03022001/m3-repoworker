@@ -14,6 +14,9 @@ events/checkpoints → autonomous loop → optional verified publication`.
   environment identity, and policy version.
 - Apple containers receive only the candidate workspace, no live repository,
   and no network by default.
+- The default `runtime_create` image is the locally provisioned
+  `repoworker-dev:local` development toolchain; it provides repository-local
+  Git/Go/Python/Node/Rust/build tooling without providing host execution.
 - MCP exposes typed operations only. A generic shell is permitted only inside
   the isolated Apple TaskWorkspace runtime at `/workspace`; RepoWorker does
   not expose an unrestricted macOS host shell or host path mutation.

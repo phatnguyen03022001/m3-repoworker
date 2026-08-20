@@ -15,7 +15,12 @@ MCP adapter. It includes:
 - M3 development shell/general lint execution through `process_run`: `sh`,
   `bash`, and `zsh` are allowed only inside the Apple container; controlled
   Python/Node/Rust/Go/tooling executable policy, deterministic candidate-local
-  PATH, bounded non-secret environment overrides, and no-network default;
+  PATH, bounded non-secret environment overrides, no-network default, and a
+  locally provisioned `repoworker-dev:local` image with Git/Go/Python/Node/
+  Rust/build tooling;
+- candidate generations receive fresh isolated Git metadata and a synthetic
+  base commit for local `git diff`/`add`/`restore`/`commit`; live `.git` is
+  never copied, mounted, or included in candidate snapshots/integration;
 - native repository intelligence, candidate/environment/policy-bound
   verification, durable runs/events/checkpoints, and bounded autonomous-loop
   resume;
@@ -74,9 +79,10 @@ mutating request and observes no duplicate workspace side effect.
   Dagu execution still needs an explicitly configured short-lived gate and
   credentials supplied by the operator outside RepoWorker state.
 - Environment installation is registry-bound but no production installer is
-  enabled in the composition root; verification images must already contain
-  the required toolchain. Registry/full runtime networking remains fail closed
-  until domain filtering is implemented.
+  enabled in the composition root; the local default development image is
+  provisioned explicitly with `scripts/build-development-image.sh`, while
+  registry/full runtime networking remains fail closed until domain filtering
+  is implemented. Explicit image overrides must provide their own toolchain.
 - The local tunnel is an external connector process. If it caches an older MCP
   schema, reconnect/re-add the connector and open a new session. The tunnel
   has been rebuilt/restarted with the current binary; a fresh frontend
@@ -86,8 +92,8 @@ mutating request and observes no duplicate workspace side effect.
 ## Current source checkpoint
 
 The current source checkpoint is local commit
-`163ee77` (`fix: derive MCP replay identity from transport requests`) on
-`main`. Automated, real Apple, real M3 E2E, and local wire-level replay gates
-are green. The external frontend mutation probe must still be observed before
-calling the live connector evidence complete. No remote push, PR, release, or
-deployment is part of this checkpoint.
+`ac98297` (`m3: provide container development toolchain`) on `main`.
+Automated, real Apple, real M3 E2E, candidate Git isolation, and local
+wire-level replay gates are green. The external frontend connector remains an
+external evidence surface and must use a fresh session after tunnel restart.
+No remote push, PR, release, or deployment is part of this checkpoint.

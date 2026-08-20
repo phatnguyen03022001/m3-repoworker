@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -299,6 +300,9 @@ func (r *Repository) Materialize(ctx context.Context) (Generation, error) {
 	}
 	defer os.RemoveAll(temporary)
 	if err := copyTree(ctx, r.root, temporary); err != nil {
+		return Generation{}, ErrRejected
+	}
+	if err := initializeCandidateGit(ctx, temporary); err != nil {
 		return Generation{}, ErrRejected
 	}
 	if err := r.assertSource(); err != nil {
@@ -726,6 +730,59 @@ func copyRegular(source, destination string, mode fs.FileMode) error {
 		return err
 	}
 	return output.Close()
+}
+
+// initializeCandidateGit creates fresh metadata for development commands. It
+// never copies the live repository's .git directory: the candidate receives a
+// new local main branch and a synthetic base commit over the already-copied
+// files. .git remains excluded from snapshots and integration plans, so Git
+// index/commit operations cannot mutate the live repository or publication
+// authority.
+func initializeCandidateGit(ctx context.Context, candidate string) error {
+	if ctx == nil || candidate == "" || !filepath.IsAbs(candidate) || filepath.Clean(candidate) != candidate {
+		return ErrRejected
+	}
+	git, err := exec.LookPath("git")
+	if err != nil || !filepath.IsAbs(git) {
+		return ErrRejected
+	}
+	environment := []string{
+		"HOME=/tmp",
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_OPTIONAL_LOCKS=0",
+		"LC_ALL=C",
+		"PATH=/usr/bin:/bin:/opt/homebrew/bin",
+		"GIT_AUTHOR_NAME=RepoWorker Candidate",
+		"GIT_AUTHOR_EMAIL=repoworker@example.invalid",
+		"GIT_COMMITTER_NAME=RepoWorker Candidate",
+		"GIT_COMMITTER_EMAIL=repoworker@example.invalid",
+	}
+	commands := [][]string{
+		{"-C", candidate, "init", "--initial-branch=main"},
+		{"-C", candidate, "config", "--local", "user.name", "RepoWorker Candidate"},
+		{"-C", candidate, "config", "--local", "user.email", "repoworker@example.invalid"},
+		{"-C", candidate, "config", "--local", "core.hooksPath", "/dev/null"},
+		{"-C", candidate, "add", "--all"},
+		{"-C", candidate, "commit", "--allow-empty", "--message", "RepoWorker candidate base"},
+	}
+	for index, args := range commands {
+		command := exec.CommandContext(ctx, git, args...)
+		command.Env = environment
+		command.Stdout = io.Discard
+		command.Stderr = io.Discard
+		if err := command.Run(); err != nil {
+			return ErrRejected
+		}
+		if index == 0 {
+			excludePath := filepath.Join(candidate, ".git", "info", "exclude")
+			if err := os.WriteFile(excludePath, []byte("/.generation.json\n/.lease.json\n/.runtime-owner.json\n"), 0o600); err != nil {
+				return ErrRejected
+			}
+		}
+	}
+	return nil
 }
 
 func excluded(relative string) bool {

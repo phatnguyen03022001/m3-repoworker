@@ -38,7 +38,7 @@ func TestControlPlaneRealM3EndToEnd(t *testing.T) {
 	stateRoot := t.TempDir()
 	image := os.Getenv("REPOWORKER_APPLE_VERIFY_IMAGE")
 	if image == "" {
-		image = "golang:1.25-alpine"
+		image = DefaultDevelopmentImage
 	}
 	provider, err := security.NewTrustedPrincipalProvider("e2e-caller")
 	if err != nil {
@@ -69,7 +69,7 @@ func TestControlPlaneRealM3EndToEnd(t *testing.T) {
 	if _, err := plane.RuntimeStart(ctx, record.Generation.ID); err != nil {
 		t.Fatalf("RuntimeStart() error = %v", err)
 	}
-	shellProcess, err := plane.ProcessStart(ctx, record.Generation.ID, runtimeRecord.ID, "sh", []string{"-lc", "printf shell-ok && printf ' PATH=%s\\n' \"$PATH\" && command -v go && go test ./... && printf a | tr a b > shell-output && test ! -e /Users/repoworker-host-path"}, "/workspace", 2*time.Minute)
+	shellProcess, err := plane.ProcessStart(ctx, record.Generation.ID, runtimeRecord.ID, "sh", []string{"-lc", "printf shell-ok && printf ' PATH=%s\\n' \"$PATH\" && command -v git && command -v go && git status --short && go test ./... && printf a | tr a b > shell-output && test ! -e /Users/repoworker-host-path"}, "/workspace", 2*time.Minute)
 	if err != nil {
 		t.Fatalf("ProcessStart(shell) error = %v", err)
 	}
@@ -88,6 +88,19 @@ func TestControlPlaneRealM3EndToEnd(t *testing.T) {
 		t.Fatalf("shell mutation escaped into live repository: %v", err)
 	}
 	t.Log("shell success and candidate isolation passed")
+	gitProbe, err := plane.ProcessStart(ctx, record.Generation.ID, runtimeRecord.ID, "sh", []string{"-lc", "printf candidate-git > git-gate && git add git-gate && git diff --cached -- git-gate && git restore --staged git-gate && rm git-gate"}, "/workspace", time.Minute)
+	if err != nil {
+		t.Fatalf("ProcessStart(git probe) error = %v", err)
+	}
+	gitOutcome, err := plane.ProcessWait(ctx, gitProbe)
+	gitChunks, readErr := plane.ProcessRead(ctx, gitProbe, 0, 128)
+	if err != nil || readErr != nil || gitOutcome.ExitCode != 0 || !strings.Contains(processChunksText(gitChunks), "candidate-git") {
+		t.Fatalf("git probe outcome = %#v, wait error = %v, read error = %v, output = %q", gitOutcome, err, readErr, processChunksText(gitChunks))
+	}
+	if _, err := os.Stat(filepath.Join(root, "git-gate")); !os.IsNotExist(err) {
+		t.Fatalf("candidate Git probe escaped into live repository: %v", err)
+	}
+	t.Log("candidate git diff/add/restore isolation passed")
 	failingShell, err := plane.ProcessStart(ctx, record.Generation.ID, runtimeRecord.ID, "sh", []string{"-lc", "printf shell-failure >&2; exit 23"}, "/workspace", time.Minute)
 	if err != nil {
 		t.Fatalf("ProcessStart(failing shell) error = %v", err)

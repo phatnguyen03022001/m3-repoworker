@@ -1,0 +1,32 @@
+FROM golang:1.26.6-alpine
+
+WORKDIR /workspace
+
+# This is a development toolchain image, not a host-shell bridge. Runtime
+# containers still receive only the candidate workspace, deterministic
+# non-secret environment, and --network none from the Apple adapter.
+RUN apk add --no-cache \
+    bash \
+    zsh \
+    git \
+    make \
+    python3 \
+    py3-pip \
+    nodejs \
+    npm \
+    cargo \
+    rustfmt \
+    && ln -sf /usr/bin/python3 /usr/local/bin/python \
+    && ln -sf /usr/bin/pip3 /usr/local/bin/pip
+
+ENV GOPATH=/go \
+    GOMODCACHE=/go/pkg/mod \
+    GOCACHE=/tmp/go-build
+
+# Preload this repository's modules so its real no-network development gate is
+# meaningful. Other repositories still fail with their normal bounded command
+# diagnostic when their dependencies are not already available locally.
+COPY go.mod go.sum /tmp/repoworker-module-cache/
+RUN cd /tmp/repoworker-module-cache \
+    && GOTOOLCHAIN=local go mod download \
+    && rm -rf /tmp/repoworker-module-cache

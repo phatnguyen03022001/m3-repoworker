@@ -15,7 +15,10 @@ The runtime path is:
    `repo_git_status` exposes a bounded, read-only Git summary.
 2. workspace_create materializes a leased candidate generation.
 3. runtime_create/start binds one Apple container to that generation with
-   `--network none` and no live-repository mount.
+   `--network none` and no live-repository mount. With no explicit image,
+   runtime_create uses the locally provisioned `repoworker-dev:local` image;
+   `scripts/build-development-image.sh` builds it with Git, Go, Python,
+   Node/npm, make, bash/zsh, and Rust tooling.
 4. process_run accepts typed executable/argv/cwd/timeout plus bounded non-secret
    environment overrides and starts through the container backend and
    supervised process groups. `sh -lc`, `bash -lc`, and `zsh -lc` are generic
@@ -47,3 +50,9 @@ tool directories (`/workspace/node_modules/.bin`, `/workspace/.venv/bin`, and
 `key=value` overrides only; baseline variables and credential-like names are
 rejected. No host environment is inherited. Registry and full network modes
 are rejected because the current Apple adapter cannot enforce domain filtering.
+The development image is only a toolchain inside the container boundary; it is
+not a host command runner. Its build context contains manifests needed for
+the repository's offline Go cache, while runtime mounts remain candidate-only.
+Materialization creates fresh candidate-only Git metadata after copying files;
+the live `.git` directory is never mounted or copied, and that metadata is
+excluded from snapshots and integration plans.

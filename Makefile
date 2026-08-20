@@ -5,7 +5,7 @@ BIN_DIR ?= bin
 GO_ENV = GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) GOPATH=$(GOPATH)
 INTERNAL_GUARD = env -u M3_REPOWORKER_INTERNAL_FIXED_PRESET -u REPOWORKER_RUN_PRESET_SEQUENCE
 
-.PHONY: bootstrap build fmt-check test test-race mcp-integration vet mod-verify offline-verify lima real-gate ci verify
+.PHONY: bootstrap build build-development-image fmt-check test test-race mcp-integration vet mod-verify offline-verify lima real-gate ci verify
 
 bootstrap:
 	mkdir -p $(GOMODCACHE)
@@ -14,6 +14,9 @@ bootstrap:
 build:
 	mkdir -p $(BIN_DIR)
 	$(INTERNAL_GUARD) $(GO_ENV) go build -trimpath -o $(BIN_DIR)/repoworker ./cmd/repoworker
+
+build-development-image:
+	./scripts/build-development-image.sh
 
 fmt-check:
 	test -z "$(shell gofmt -l $$(find cmd internal -name '*.go' -print))"
@@ -42,6 +45,7 @@ lima:
 ci: fmt-check vet test test-race mcp-integration mod-verify build
 
 real-gate:
+	./scripts/build-development-image.sh
 	@echo "real Apple lifecycle gate: RUN"
 	$(INTERNAL_GUARD) $(GO_ENV) go test ./internal/runtime -run '^TestAppleContainerRealLifecycle$$' -count=1 -v
 	@echo "real Apple lifecycle gate: PASS"

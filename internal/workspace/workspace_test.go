@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -51,8 +52,8 @@ func TestMaterializeIsolatedGenerationWithSnapshotBinding(t *testing.T) {
 	if err != nil || string(content) != "before\n" {
 		t.Fatalf("generation content = %q, %v", content, err)
 	}
-	if _, err := os.Stat(filepath.Join(generation.Path, ".git")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("live .git copied into generation: %v", err)
+	if info, err := os.Stat(filepath.Join(generation.Path, ".git")); err != nil || !info.IsDir() {
+		t.Fatalf("candidate Git metadata missing: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(generation.Path, ".cache")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("cache copied into generation: %v", err)
@@ -66,6 +67,34 @@ func TestMaterializeIsolatedGenerationWithSnapshotBinding(t *testing.T) {
 	content, err = os.ReadFile(filepath.Join(generation.Path, "main.txt"))
 	if err != nil || string(content) != "before\n" {
 		t.Fatalf("generation changed with live source = %q, %v", content, err)
+	}
+}
+
+func TestCandidateGitOperationsStayInsideGeneration(t *testing.T) {
+	repoRoot := t.TempDir()
+	stateRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repoRoot, "main.txt"), []byte("before\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := OpenRepository(repoRoot, stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation, err := repository.Materialize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(generation.Path, "main.txt"), []byte("after\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("git", "-C", generation.Path, "diff", "--", "main.txt")
+	output, err := command.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "+after") {
+		t.Fatalf("candidate git diff = %q, error = %v", output, err)
+	}
+	live, err := os.ReadFile(filepath.Join(repoRoot, "main.txt"))
+	if err != nil || string(live) != "before\n" {
+		t.Fatalf("live repository changed by candidate Git: %q, error = %v", live, err)
 	}
 }
 

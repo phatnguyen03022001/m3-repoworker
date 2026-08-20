@@ -47,6 +47,13 @@ type Config struct {
 	OperatorAuthority security.OperatorAuthority
 }
 
+// DefaultDevelopmentImage is the locally provisioned toolchain image used by
+// production runtime_create calls when the caller does not select an image.
+// It is deliberately a local tag: the image is built by the operator from
+// container/Containerfile.development and is never pulled or widened into a
+// host execution capability by RepoWorker.
+const DefaultDevelopmentImage = "repoworker-dev:local"
+
 type WorkspaceRecord struct {
 	Generation workspace.Generation `json:"generation"`
 	Lease      workspace.Lease      `json:"lease"`
@@ -108,7 +115,7 @@ func Open(ctx context.Context, config Config) (*Plane, error) {
 		return nil, ErrRejected
 	}
 	if config.Image == "" {
-		config.Image = "alpine:latest"
+		config.Image = DefaultDevelopmentImage
 	}
 	readRepo, err := repo.New(config.RepositoryRoot)
 	if err != nil {

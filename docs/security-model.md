@@ -56,6 +56,14 @@ bounded argv, passes only explicit `key=value` values, and kills the process
 group on cancellation/timeout. The baseline PATH includes candidate-local
 tool directories but never inherits the host environment.
 
+The default `repoworker-dev:local` image is an explicitly provisioned local
+toolchain image, not a host-shell escape hatch. It supplies Git, Go, Python,
+Node/npm, make, and Rust tooling inside the container; the image build and
+runtime still use no live-repository mount, no host credentials, and no
+outbound network by default. Selecting a different image is explicit, and a
+missing tool fails as a bounded process error rather than falling back to the
+macOS host.
+
 Event and loop payloads are bounded and reject common credential markers.
 Verification diagnostics are redacted and bounded. Publication never places
 credentials in command arguments; external mutation is disabled unless the

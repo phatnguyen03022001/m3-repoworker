@@ -42,7 +42,13 @@ timestamp. Có thể đổi vị trí state bằng `REPOWORKER_STATE_DIR`.
 
 Requirements: Go 1.26.6, Git, Apple `container` CLI plus a running container
 machine for real runtime tests, and Lima only for validating the supplied VM
-template.
+template. The production default runtime image is the local
+`repoworker-dev:local` development image; provision it before using the real
+shell/toolchain gate:
+
+```sh
+./scripts/build-development-image.sh
+```
 
 ```sh
 make bootstrap
@@ -53,7 +59,8 @@ make offline-verify
 
 Các lệnh Go dùng cache riêng trong `.cache/`; `offline-verify` chỉ chạy sau khi
 `bootstrap` đã tải đủ module. `make verify` chạy fast gates, Lima validation,
-và cả hai real DoD gates. Nếu Apple prerequisite thiếu, gate báo `NOT RUN` và
+builds the local development image, và cả hai real DoD gates. Nếu Apple
+prerequisite thiếu, gate báo `NOT RUN` và
 trả lỗi; không coi `SKIP` là GREEN. `make offline-verify` chỉ là offline gate
 và không thay thế real DoD gate. Binary nằm ở `bin/repoworker`.
 
@@ -61,6 +68,7 @@ Apple prerequisite:
 
 ```sh
 container machine create --name repoworker alpine:3.22
+./scripts/build-development-image.sh
 ```
 
 Real Apple lifecycle gate:
@@ -136,7 +144,11 @@ Rust:   cargo test, cargo fmt --check, cargo clippy
 Generic: make test, make lint, ./scripts/test.sh, ./scripts/lint.sh
 ```
 
-Các tool phải có sẵn trong image hoặc candidate workspace. PATH deterministic
+The default `repoworker-dev:local` image contains Git, Go 1.26.6, Python 3,
+pip, Node/npm, make, bash/zsh, and Rust/cargo tooling. It also preloads this
+repository's Go modules for the no-network gate. An explicitly selected image
+must provide its own toolchain and dependencies; a missing command fails
+normally inside the bounded process path. PATH deterministic
 bao gồm `node_modules/.bin`, `.venv/bin`, và `bin/`; host PATH, credentials,
 brew, sudo, host pip/npm-global và host filesystem không được kế thừa.
 
@@ -167,7 +179,9 @@ disabled.
 
 Checkout phải ở `main` khi khởi động; mọi mutation re-check trusted branch.
 State nằm ngoài checkout với quyền private. Path là relative, bounded,
-symlink-safe, không chạm `.git`, credential stores, hay state root. Apple
+symlink-safe, không chạm live repository `.git`, credential stores, hay state root.
+Candidate workspaces receive fresh isolated Git metadata for local development;
+that metadata is never copied from the live checkout or integrated. Apple
 runtime chỉ mount workspace cô lập, no-network mặc định, và chạy typed
 executable qua supervised process group. Registry/full network hiện fail closed
 vì Apple adapter chưa có domain-filtered network primitive; không giả lập
