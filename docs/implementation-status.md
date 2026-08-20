@@ -59,6 +59,7 @@ isolation, and a close/reopen loop resume with runtime recreation.
 
 ## Current source checkpoint
 
-The source was audited from local HEAD `72a2c8c7fd18a496aad368aa4d6542bb7af5080f`.
-The final local checkpoint must update this line after the automated and real
-gates pass. No remote push, PR, release, or deployment is part of this work.
+The verified implementation checkpoint is local commit
+`e0a996d5f24cbad5c003f4094cb1b77429ea8f4d` on `main`, descended from the
+audited source HEAD `72a2c8c7fd18a496aad368aa4d6542bb7af5080f`. No remote push,
+PR, release, or deployment is part of this work.
