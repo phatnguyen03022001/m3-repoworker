@@ -22,12 +22,18 @@ func TestMain(m *testing.M) {
 }
 
 func TestVerificationPresetsAndEnvironmentsAreClosed(t *testing.T) {
+	verifiedCWD := filepath.Join(string(filepath.Separator), "verified", "repo")
+	cache := cachePaths{
+		goBuild: filepath.Join(verifiedCWD, ".cache", "go-build"),
+		goMod:   filepath.Join(verifiedCWD, ".cache", "go-mod"),
+		goPath:  filepath.Join(verifiedCWD, ".cache", "go-path"),
+	}
 	for _, check := range []string{"fmt", "test", "test-race", "vet", "mcp-integration", "verify"} {
 		preset, ok := VerificationPreset(check)
 		if !ok || preset != Preset(check) {
 			t.Fatalf("VerificationPreset(%q) = %q, %v", check, preset, ok)
 		}
-		environment := strings.Join(commandEnvironment(preset), "\n")
+		environment := strings.Join(commandEnvironment(preset, cache), "\n")
 		if !strings.Contains(environment, "GOPROXY=off") {
 			t.Fatalf("%s environment enables network: %q", check, environment)
 		}
@@ -41,7 +47,7 @@ func TestVerificationPresetsAndEnvironmentsAreClosed(t *testing.T) {
 
 	t.Setenv("GITHUB_TOKEN", "must-not-propagate")
 	t.Setenv("SSH_AUTH_SOCK", "/tmp/must-not-propagate")
-	maintenance := strings.Join(commandEnvironment(PresetGoModTidy), "\n")
+	maintenance := strings.Join(commandEnvironment(PresetGoModTidy, cache), "\n")
 	if !strings.Contains(maintenance, "GOPROXY=https://proxy.golang.org") ||
 		!strings.Contains(maintenance, "GONOPROXY=none") ||
 		strings.Contains(maintenance, "must-not-propagate") ||
@@ -51,6 +57,99 @@ func TestVerificationPresetsAndEnvironmentsAreClosed(t *testing.T) {
 	}
 	if strings.Contains(maintenance, InternalPresetEnvironment+"=") {
 		t.Fatal("internal runner marker leaked to fixed command")
+	}
+	helper := strings.Join(helperEnvironment(), "\n")
+	if strings.Contains(helper, "GOCACHE=") || strings.Contains(helper, "GOMODCACHE=") || strings.Contains(helper, "/dev/fd/") {
+		t.Fatalf("helper environment contains cache path: %q", helper)
+	}
+	finalEnvironment := strings.Join(commandEnvironment(PresetTest, cache), "\n")
+	if strings.Contains(finalEnvironment, "/dev/fd/") ||
+		!strings.Contains(finalEnvironment, "GOCACHE="+cache.goBuild) ||
+		!strings.Contains(finalEnvironment, "GOMODCACHE="+cache.goMod) {
+		t.Fatalf("fixed command environment contains invalid cache paths: %q", finalEnvironment)
+	}
+	for _, value := range []string{cache.goBuild, cache.goMod} {
+		if !filepath.IsAbs(value) {
+			t.Fatalf("cache path is not absolute: %q", value)
+		}
+		relative, err := filepath.Rel(verifiedCWD, value)
+		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			t.Fatalf("cache path %q escapes verified cwd %q", value, verifiedCWD)
+		}
+	}
+}
+
+func TestEnsureCacheDirectoriesReturnsVerifiedAbsolutePaths(t *testing.T) {
+	rootPath := t.TempDir()
+	root, err := os.Open(rootPath)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+	var rootStat unix.Stat_t
+	if err := unix.Fstat(int(root.Fd()), &rootStat); err != nil {
+		t.Fatalf("fstat root: %v", err)
+	}
+
+	cache, err := ensureCacheDirectories(int(root.Fd()), uint64(rootStat.Dev), rootPath)
+	if err != nil {
+		t.Fatalf("ensureCacheDirectories() error = %v", err)
+	}
+	for name, path := range map[string]string{
+		"go-build": cache.goBuild,
+		"go-mod":   cache.goMod,
+	} {
+		if !filepath.IsAbs(path) {
+			t.Fatalf("%s cache path is not absolute: %q", name, path)
+		}
+		relative, err := filepath.Rel(rootPath, path)
+		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			t.Fatalf("%s cache path %q escapes root %q", name, path, rootPath)
+		}
+		info, err := os.Stat(path)
+		if err != nil || !info.IsDir() {
+			t.Fatalf("%s cache directory is invalid: %v", name, err)
+		}
+	}
+}
+
+func TestVerifyRootPathRejectsReplacementAndIdentityMismatch(t *testing.T) {
+	parent := t.TempDir()
+	rootPath := filepath.Join(parent, "repo")
+	if err := os.Mkdir(rootPath, 0o700); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+	root, err := os.Open(rootPath)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+	var rootStat unix.Stat_t
+	if err := unix.Fstat(int(root.Fd()), &rootStat); err != nil {
+		t.Fatalf("fstat root: %v", err)
+	}
+	if err := verifyRootPath(int(root.Fd()), rootPath, rootStat); err != nil {
+		t.Fatalf("verifyRootPath(original) error = %v", err)
+	}
+
+	movedPath := filepath.Join(parent, "repo-moved")
+	if err := os.Rename(rootPath, movedPath); err != nil {
+		t.Fatalf("rename root: %v", err)
+	}
+	if err := os.Mkdir(rootPath, 0o700); err != nil {
+		t.Fatalf("mkdir replacement: %v", err)
+	}
+	if err := verifyRootPath(int(root.Fd()), rootPath, rootStat); !errors.Is(err, ErrRejected) {
+		t.Fatalf("verifyRootPath(replacement) error = %v, want ErrRejected", err)
+	}
+	if err := verifyRootPath(int(root.Fd()), movedPath, rootStat); err != nil {
+		t.Fatalf("verifyRootPath(moved) error = %v", err)
+	}
+
+	mismatch := rootStat
+	mismatch.Ino++
+	if err := verifyRootPath(int(root.Fd()), movedPath, mismatch); !errors.Is(err, ErrRejected) {
+		t.Fatalf("verifyRootPath(identity mismatch) error = %v, want ErrRejected", err)
 	}
 }
 

@@ -130,7 +130,7 @@ func runWithTimeout(ctx context.Context, root *os.File, preset Preset, redaction
 
 	command := exec.Command(executable)
 	command.ExtraFiles = []*os.File{root, controlWriter}
-	command.Env = append(commandEnvironment(preset), InternalPresetEnvironment+"="+string(preset))
+	command.Env = append(helperEnvironment(), InternalPresetEnvironment+"="+string(preset))
 	command.Stdin = nil
 	command.Stdout = capture
 	command.Stderr = capture
@@ -225,13 +225,18 @@ func RunInternal(preset Preset) int {
 	if err := unix.Fstat(internalRootFD, &rootStat); err != nil || rootStat.Mode&unix.S_IFMT != unix.S_IFDIR {
 		return fail(StageStart)
 	}
-	if err := ensureCacheDirectories(internalRootFD, uint64(rootStat.Dev)); err != nil {
-		return fail(StageStart)
-	}
 	if err := unix.Fchdir(internalRootFD); err != nil {
 		return fail(StageStart)
 	}
 	if !currentDirectoryMatches(internalRootFD, rootStat) {
+		return fail(StageStart)
+	}
+	verifiedCWD, err := verifiedWorkingDirectory(internalRootFD, rootStat)
+	if err != nil {
+		return fail(StageStart)
+	}
+	cache, err := ensureCacheDirectories(internalRootFD, uint64(rootStat.Dev), verifiedCWD)
+	if err != nil {
 		return fail(StageStart)
 	}
 	if control != nil {
@@ -243,7 +248,7 @@ func RunInternal(preset Preset) int {
 		return fail(StageResolve)
 	}
 	arguments := append([]string{executable}, definition.arguments...)
-	if err := unix.Exec(executable, arguments, commandEnvironment(preset)); err != nil {
+	if err := unix.Exec(executable, arguments, commandEnvironment(preset, cache)); err != nil {
 		return fail(StageStart)
 	}
 	return 0
@@ -274,20 +279,114 @@ func currentDirectoryMatches(rootFD int, expected unix.Stat_t) bool {
 	return uint64(current.Dev) == uint64(expected.Dev) && uint64(current.Ino) == uint64(expected.Ino)
 }
 
-func ensureCacheDirectories(rootFD int, rootDevice uint64) error {
+func verifiedWorkingDirectory(rootFD int, expected unix.Stat_t) (string, error) {
+	if !currentDirectoryMatches(rootFD, expected) {
+		return "", ErrRejected
+	}
+	cwd, err := os.Getwd()
+	if err != nil || !filepath.IsAbs(cwd) {
+		return "", ErrRejected
+	}
+	if err := verifyRootPath(rootFD, cwd, expected); err != nil {
+		return "", err
+	}
+	return filepath.Clean(cwd), nil
+}
+
+func verifyRootPath(rootFD int, path string, expected unix.Stat_t) error {
+	if !filepath.IsAbs(path) {
+		return ErrRejected
+	}
+	pathFD, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return ErrRejected
+	}
+	defer unix.Close(pathFD)
+	var pathStat unix.Stat_t
+	if err := unix.Fstat(pathFD, &pathStat); err != nil {
+		return ErrRejected
+	}
+	var openedStat unix.Stat_t
+	if err := unix.Fstat(rootFD, &openedStat); err != nil {
+		return ErrRejected
+	}
+	if uint64(openedStat.Dev) != uint64(expected.Dev) || uint64(openedStat.Ino) != uint64(expected.Ino) ||
+		uint64(pathStat.Dev) != uint64(expected.Dev) || uint64(pathStat.Ino) != uint64(expected.Ino) {
+		return ErrRejected
+	}
+	return nil
+}
+
+type cachePaths struct {
+	goBuild string
+	goMod   string
+	goPath  string
+}
+
+func ensureCacheDirectories(rootFD int, rootDevice uint64, verifiedCWD string) (cachePaths, error) {
+	if !filepath.IsAbs(verifiedCWD) {
+		return cachePaths{}, ErrRejected
+	}
 	cacheFD, err := openOrCreateDirectoryAt(rootFD, ".cache", rootDevice)
 	if err != nil {
-		return err
+		return cachePaths{}, err
 	}
 	defer unix.Close(cacheFD)
-	for _, name := range []string{"go-build", "go-mod"} {
+	cacheRoot := filepath.Join(verifiedCWD, ".cache")
+	if err := verifyDirectoryPath(cacheRoot, cacheFD, rootDevice); err != nil {
+		return cachePaths{}, err
+	}
+
+	result := cachePaths{}
+	for _, name := range []string{"go-build", "go-mod", "go-path"} {
 		childFD, err := openOrCreateDirectoryAt(cacheFD, name, rootDevice)
 		if err != nil {
-			return err
+			return cachePaths{}, err
+		}
+		absolutePath := filepath.Join(cacheRoot, name)
+		if err := verifyDirectoryPath(absolutePath, childFD, rootDevice); err != nil {
+			unix.Close(childFD)
+			return cachePaths{}, err
+		}
+		switch name {
+		case "go-build":
+			result.goBuild = absolutePath
+		case "go-mod":
+			result.goMod = absolutePath
+		case "go-path":
+			result.goPath = absolutePath
 		}
 		if err := unix.Close(childFD); err != nil {
-			return ErrRejected
+			return cachePaths{}, ErrRejected
 		}
+	}
+	if result.goBuild == "" || result.goMod == "" || result.goPath == "" {
+		return cachePaths{}, ErrRejected
+	}
+	return result, nil
+}
+
+func verifyDirectoryPath(path string, openedFD int, rootDevice uint64) error {
+	if !filepath.IsAbs(path) {
+		return ErrRejected
+	}
+	pathFD, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return ErrRejected
+	}
+	defer unix.Close(pathFD)
+	var pathStat unix.Stat_t
+	var openedStat unix.Stat_t
+	if err := unix.Fstat(pathFD, &pathStat); err != nil {
+		return ErrRejected
+	}
+	if err := unix.Fstat(openedFD, &openedStat); err != nil {
+		return ErrRejected
+	}
+	if pathStat.Mode&unix.S_IFMT != unix.S_IFDIR || openedStat.Mode&unix.S_IFMT != unix.S_IFDIR ||
+		uint64(pathStat.Dev) != rootDevice || uint64(openedStat.Dev) != rootDevice ||
+		uint64(pathStat.Dev) != uint64(openedStat.Dev) || uint64(pathStat.Ino) != uint64(openedStat.Ino) {
+		return ErrRejected
 	}
 	return nil
 }
@@ -311,9 +410,17 @@ func openOrCreateDirectoryAt(parentFD int, name string, rootDevice uint64) (int,
 	return fd, nil
 }
 
-func commandEnvironment(preset Preset) []string {
+func helperEnvironment() []string {
+	return []string{
+		"PATH=" + os.Getenv("PATH"),
+		"LC_ALL=C",
+		"LANG=C",
+	}
+}
+
+func commandEnvironment(preset Preset, cache cachePaths) []string {
 	definition, ok := commandDefinitions[preset]
-	if !ok {
+	if !ok || !filepath.IsAbs(cache.goBuild) || !filepath.IsAbs(cache.goMod) || !filepath.IsAbs(cache.goPath) {
 		return nil
 	}
 	environment := []string{
@@ -324,8 +431,9 @@ func commandEnvironment(preset Preset) []string {
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_OPTIONAL_LOCKS=0",
-		"GOCACHE=/dev/fd/3/.cache/go-build",
-		"GOMODCACHE=/dev/fd/3/.cache/go-mod",
+		"GOCACHE=" + cache.goBuild,
+		"GOMODCACHE=" + cache.goMod,
+		"GOPATH=" + cache.goPath,
 	}
 	if definition.network {
 		environment = append(environment,
