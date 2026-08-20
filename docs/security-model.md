@@ -27,3 +27,9 @@ M3.3 keeps process output bounded and spills overflow to private files. Process
 groups are killed on cancellation/timeout, PTY is interactive-only, and
 environment variables with credential-bearing names are rejected before a
 starter is called.
+
+M3.4 runtime creation binds task, generation, lease fence, and workspace path;
+  one runtime is admitted per generation. Apple container receives no live
+  repository mount and defaults to `--network none`; invalid resource limits,
+  full network, and adapter absence fail closed. Persisted active runtimes are
+  stopped/deleted at recovery or quarantined if cleanup fails.

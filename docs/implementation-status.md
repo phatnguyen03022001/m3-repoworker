@@ -54,3 +54,18 @@
   network/resource defaults, identity binding, and crash cleanup.
 - Exact next action: define the `RuntimeBackend` contract and lifecycle state
   machine, then add Apple container/Lima adapters with mount and network tests.
+
+## M3.4 — IN PROGRESS
+
+- State: runtime lifecycle and adapters implemented locally; verification and
+  checkpoint pending.
+- Scope: typed lifecycle states, one runtime per generation, Apple container
+  primary CLI adapter, Lima fallback/test adapter, isolated mount binding,
+  default no-network, CPU/RAM limits, identity binding, persisted lifecycle,
+  and crash cleanup/quarantine.
+- Tests: runtime tests cover lifecycle, duplicate admission, live mount
+  overlap, stale lease, persisted crash recovery, and Apple command binding.
+- Decisions: see `docs/adr/0004-m3.4-isolated-runtime.md`.
+- Remaining: run full verification and checkpoint on `main`.
+- Exact next action: run `make verify`, `govulncheck ./...`, inspect the diff,
+  and commit `m3.4: isolated Apple container runtime`.

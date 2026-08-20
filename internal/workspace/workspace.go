@@ -317,6 +317,21 @@ func (r *Repository) AssertLease(ctx context.Context, lease Lease) error {
 	return nil
 }
 
+// AssertGeneration binds a runtime or integration owner to the exact
+// generation metadata and live lease fence.
+func (r *Repository) AssertGeneration(ctx context.Context, generation Generation, lease Lease) error {
+	if err := r.AssertLease(ctx, lease); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	loaded, err := r.loadGeneration(generation.ID)
+	if err != nil || loaded.Path != generation.Path || loaded.CandidateSnapshot != generation.CandidateSnapshot || lease.GenerationID != generation.ID {
+		return ErrStaleFence
+	}
+	return nil
+}
+
 // ReserveRuntime permits one runtime owner for a generation and binds the
 // reservation to the active lease fence.
 func (r *Repository) ReserveRuntime(ctx context.Context, lease Lease, owner string) error {

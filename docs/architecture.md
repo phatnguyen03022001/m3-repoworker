@@ -18,6 +18,9 @@ The current M3.1 substrate consists of:
   policy compilation, and redacted audit events.
 - `internal/process`: typed supervised processes, bounded cursor streams,
   durable spill, cancellation/timeout cleanup, signals, and optional PTY.
+- `internal/runtime`: lifecycle manager with Apple container primary adapter,
+  Lima fallback/test adapter, isolated workspace mount binding, and crash
+  cleanup.
 
 M3.2–M3.10 will bind authenticated principals, capabilities, process/runtime
 backends, resource admission, verification, events, autonomous-loop state,
