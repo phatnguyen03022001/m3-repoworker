@@ -92,10 +92,11 @@
 - Exact next action: define environment and cache identities bound to
   toolchain/platform/lockfile/policy, then add cold/warm/corrupt-cache tests.
 
-## M3.6 — IN PROGRESS
+## M3.6 — GREEN
 
-- State: reproducible environment and cache layer implemented locally;
-  verification and checkpoint pending.
+- State: reproducible environment and cache layer implemented and checkpointed
+  on local `main`.
+- Commit: `9165206` (`m3.6: reproducible environments and cache`).
 - Scope: deterministic Go/Node/Rust/Nx/Turbo/Bazel manifest detection,
   lockfile hashing, environment generations, registry-only installer boundary,
   cache provenance/content verification, poisoning rejection, and cold-cache
@@ -104,6 +105,7 @@
   install, cold/warm equivalence, policy-bound cache keys, corruption, cache
   deletion, and symlink manifests.
 - Decisions: see `docs/adr/0006-m3.6-reproducible-environments.md`.
-- Remaining: run full verification and checkpoint on `main`.
-- Exact next action: run `make verify`, `govulncheck ./...`, inspect the diff,
-  and commit `m3.6: reproducible environments and cache`.
+- Remaining: M3.7 deterministic repository intelligence adapters and
+  candidate/environment/policy-bound verification.
+- Exact next action: implement native Go/Node/Rust/Nx/Turbo/Bazel detection,
+  targeted/full verification plans, and invalidate results on snapshot change.
