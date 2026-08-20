@@ -91,9 +91,11 @@ mutating request and observes no duplicate workspace side effect.
 
 ## Current source checkpoint
 
-The current source checkpoint is local commit
-`ac98297` (`m3: provide container development toolchain`) on `main`.
+The implementation checkpoint is local commit
+`47dec4f` (`m3: provide container development toolchain`) on `main`.
 Automated, real Apple, real M3 E2E, candidate Git isolation, and local
-wire-level replay gates are green. The external frontend connector remains an
-external evidence surface and must use a fresh session after tunnel restart.
-No remote push, PR, release, or deployment is part of this checkpoint.
+wire-level replay gates are green. The documentation-only follow-up commit
+may advance `HEAD`; verify the exact full current hash with `git rev-parse
+HEAD`. The external frontend connector remains an external evidence surface
+and must use a fresh session after tunnel restart. No remote push, PR, release,
+or deployment is part of this checkpoint.
