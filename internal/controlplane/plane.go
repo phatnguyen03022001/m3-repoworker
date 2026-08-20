@@ -96,6 +96,8 @@ type Plane struct {
 	processes     map[string]ProcessRecord
 	verifications map[string]VerificationRecord
 	environments  map[string]environment.Generation
+	pending       map[string]security.ConfirmationBinding
+	replay        *security.RequestReplayCache
 	image         string
 }
 
@@ -233,7 +235,7 @@ func Open(ctx context.Context, config Config) (*Plane, error) {
 		_ = readRepo.Close()
 		return nil, ErrRejected
 	}
-	plane = &Plane{Repo: readRepo, Repository: isolated, Tasks: tasks, Memory: memoryStore, Security: engine, Operator: config.OperatorAuthority, Processes: processes, Runtimes: runtimes, Scheduler: schedulerInstance, Environment: environments, Events: eventStore, Publication: publicationAdapter, RepositoryID: repositoryID, FilesystemID: filesystemID, PrincipalID: principal.ID, SessionID: session.ID, StateRoot: config.StateRoot, session: session, trustedRef: trustedRef, workspaces: map[string]WorkspaceRecord{}, runtimes: map[string]m3runtime.Runtime{}, processes: map[string]ProcessRecord{}, verifications: map[string]VerificationRecord{}, environments: map[string]environment.Generation{}, loopCancels: map[string]context.CancelFunc{}, image: config.Image}
+	plane = &Plane{Repo: readRepo, Repository: isolated, Tasks: tasks, Memory: memoryStore, Security: engine, Operator: config.OperatorAuthority, Processes: processes, Runtimes: runtimes, Scheduler: schedulerInstance, Environment: environments, Events: eventStore, Publication: publicationAdapter, RepositoryID: repositoryID, FilesystemID: filesystemID, PrincipalID: principal.ID, SessionID: session.ID, StateRoot: config.StateRoot, session: session, trustedRef: trustedRef, workspaces: map[string]WorkspaceRecord{}, runtimes: map[string]m3runtime.Runtime{}, processes: map[string]ProcessRecord{}, verifications: map[string]VerificationRecord{}, environments: map[string]environment.Generation{}, pending: map[string]security.ConfirmationBinding{}, replay: security.NewDefaultRequestReplayCache(), loopCancels: map[string]context.CancelFunc{}, image: config.Image}
 	return plane, nil
 }
 
@@ -286,17 +288,58 @@ func (p *Plane) authorizeWithBinding(ctx context.Context, capability security.Ca
 	return nil
 }
 
-func (p *Plane) IssueOperatorConfirmation(ctx context.Context, request security.OperatorConfirmationRequest) (security.Confirmation, error) {
+// AcceptMCPRequest records the request identity supplied in the MCP SDK's
+// CallToolParams._meta. The SDK session handle is supplied by the adapter;
+// authenticated transport, principal, and control-plane session bindings are
+// taken from this plane and cannot be supplied by the caller.
+func (p *Plane) AcceptMCPRequest(ctx context.Context, mcpSessionID, requestID string, sequence uint64) error {
+	if p == nil || ctx == nil {
+		return ErrRejected
+	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p == nil || p.Operator == nil || request.Binding.RepositoryID != p.RepositoryID || request.Binding.PrincipalID != p.PrincipalID || request.Binding.SessionID != p.session.ID {
+	session := p.session
+	replay := p.replay
+	p.mu.Unlock()
+	if replay == nil {
+		return ErrRejected
+	}
+	if err := replay.Accept(session.TransportID, session.ID, session.PrincipalID, mcpSessionID, requestID, sequence); err != nil {
+		return ErrRejected
+	}
+	return nil
+}
+
+func (p *Plane) IssueOperatorConfirmation(ctx context.Context, request security.OperatorConfirmationRequest) (security.Confirmation, error) {
+	if p == nil {
 		return security.Confirmation{}, ErrRejected
 	}
-	confirmation, err := p.Security.IssueOperatorConfirmation(ctx, p.Operator, request)
+	p.mu.Lock()
+	operator := p.Operator
+	expected, ok := p.pending[confirmationPendingKey(request.Class, request.Binding.GenerationID)]
+	if operator == nil || !ok || expected != request.Binding || request.Binding.RepositoryID != p.RepositoryID || request.Binding.PrincipalID != p.PrincipalID || request.Binding.SessionID != p.session.ID {
+		p.mu.Unlock()
+		return security.Confirmation{}, ErrRejected
+	}
+	delete(p.pending, confirmationPendingKey(request.Class, request.Binding.GenerationID))
+	p.mu.Unlock()
+	confirmation, err := p.Security.IssueOperatorConfirmation(ctx, operator, request)
 	if err != nil {
 		return security.Confirmation{}, ErrRejected
 	}
 	return confirmation, nil
+}
+
+func confirmationPendingKey(class security.ConfirmationClass, generationID string) string {
+	return string(class) + "\x00" + generationID
+}
+
+func (p *Plane) rememberConfirmationBinding(class security.ConfirmationClass, binding security.ConfirmationBinding) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pending == nil {
+		p.pending = make(map[string]security.ConfirmationBinding)
+	}
+	p.pending[confirmationPendingKey(class, binding.GenerationID)] = binding
 }
 
 func (p *Plane) IntegrationConfirmationBinding(ctx context.Context, generationID string) (security.ConfirmationBinding, error) {
@@ -308,7 +351,9 @@ func (p *Plane) IntegrationConfirmationBinding(ctx context.Context, generationID
 	if err != nil {
 		return security.ConfirmationBinding{}, ErrRejected
 	}
-	return security.ConfirmationBinding{Action: digestText("repository.integrate:" + plan.PlanDigest), RepositoryID: p.RepositoryID, PrincipalID: p.PrincipalID, SessionID: p.session.ID, GenerationID: generationID, FencingGeneration: record.Lease.FencingGeneration, CandidateSnapshot: record.Generation.CandidateSnapshot, PlanDigest: plan.PlanDigest}, nil
+	binding := security.ConfirmationBinding{Action: digestText("repository.integrate:" + plan.PlanDigest), RepositoryID: p.RepositoryID, PrincipalID: p.PrincipalID, SessionID: p.session.ID, GenerationID: generationID, FencingGeneration: record.Lease.FencingGeneration, CandidateSnapshot: record.Generation.CandidateSnapshot, PlanDigest: plan.PlanDigest}
+	p.rememberConfirmationBinding(security.ConfirmationDestructive, binding)
+	return binding, nil
 }
 
 func (p *Plane) CreateWorkspace(ctx context.Context, taskID string) (WorkspaceRecord, error) {
@@ -405,7 +450,17 @@ func (p *Plane) IntegrationPlan(ctx context.Context, generationID string) (works
 	if err := p.authorize(ctx, security.CapabilityWorkspaceRead, security.TargetTaskWorkspace, "", security.ExecutionSpec{}, "", record.Generation); err != nil {
 		return workspace.IntegrationPlan{}, ErrRejected
 	}
-	return p.Repository.BuildIntegrationPlan(ctx, record.Generation, record.Lease)
+	plan, err := p.Repository.BuildIntegrationPlan(ctx, record.Generation, record.Lease)
+	if err != nil {
+		return workspace.IntegrationPlan{}, ErrRejected
+	}
+	// Planning is read-only for the repository, but it creates the short-lived
+	// pending record that the independent operator channel must approve. The
+	// record is only available when the candidate is still verified.
+	if p.hasVerifiedCandidate(ctx, record) {
+		p.rememberConfirmationBinding(security.ConfirmationDestructive, security.ConfirmationBinding{Action: digestText("repository.integrate:" + plan.PlanDigest), RepositoryID: p.RepositoryID, PrincipalID: p.PrincipalID, SessionID: p.session.ID, GenerationID: generationID, FencingGeneration: record.Lease.FencingGeneration, CandidateSnapshot: record.Generation.CandidateSnapshot, PlanDigest: plan.PlanDigest})
+	}
+	return plan, nil
 }
 
 func (p *Plane) Integrate(ctx context.Context, generationID, confirmation string) (workspace.IntegrationJournal, error) {

@@ -2,14 +2,21 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"os"
+	"path/filepath"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/tienphat/m3-repoworker/internal/controlplane"
+	"github.com/tienphat/m3-repoworker/internal/operator"
 	"github.com/tienphat/m3-repoworker/internal/repo"
 	"github.com/tienphat/m3-repoworker/internal/security"
 	"github.com/tienphat/m3-repoworker/internal/taskstate"
@@ -20,6 +27,13 @@ type StatusInput struct{}
 
 type StatusOutput struct {
 	Status string `json:"status"`
+}
+
+type RepoStatusOutput struct {
+	Status       string `json:"status"`
+	RepositoryID string `json:"repository_id"`
+	PrincipalID  string `json:"principal_id"`
+	SessionID    string `json:"session_id"`
 }
 
 type RepoReadInput struct {
@@ -120,7 +134,11 @@ func newServer(repoRoot, stateRoot string) (*mcp.Server, *controlplane.Plane, er
 }
 
 func newServerWithProvider(repoRoot, stateRoot string, provider security.PrincipalProvider) (*mcp.Server, *controlplane.Plane, error) {
-	plane, err := controlplane.Open(context.Background(), controlplane.Config{RepositoryRoot: repoRoot, StateRoot: stateRoot, PrincipalProvider: provider})
+	return newServerWithProviderAndAuthority(repoRoot, stateRoot, provider, nil)
+}
+
+func newServerWithProviderAndAuthority(repoRoot, stateRoot string, provider security.PrincipalProvider, authority security.OperatorAuthority) (*mcp.Server, *controlplane.Plane, error) {
+	plane, err := controlplane.Open(context.Background(), controlplane.Config{RepositoryRoot: repoRoot, StateRoot: stateRoot, PrincipalProvider: provider, OperatorAuthority: authority})
 	if err != nil {
 		return nil, nil, errRequestRejected
 	}
@@ -471,6 +489,13 @@ func main() {
 	if preset, ok := verify.InternalRequest(); ok {
 		os.Exit(verify.RunInternal(preset))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "operator-approve" {
+		if err := runOperatorApprove(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "operator request rejected")
+			os.Exit(1)
+		}
+		return
+	}
 	flags := flag.NewFlagSet("repoworker", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	repoRoot := flags.String("repo-root", "", "absolute repository root")
@@ -504,10 +529,32 @@ func run(ctx context.Context, transport mcp.Transport, repoRoot, stateRoot strin
 }
 
 func runWithProvider(ctx context.Context, transport mcp.Transport, repoRoot, stateRoot string, provider security.PrincipalProvider) error {
-	server, plane, err := newServerWithProvider(repoRoot, stateRoot, provider)
+	return runWithProviderAndSocket(ctx, transport, repoRoot, stateRoot, provider, filepath.Join(stateRoot, "operator.sock"))
+}
+
+func runWithProviderAndSocket(ctx context.Context, transport mcp.Transport, repoRoot, stateRoot string, provider security.PrincipalProvider, socketPath string) error {
+	key, err := ensureOperatorKey(stateRoot)
 	if err != nil {
 		return errRequestRejected
 	}
+	operatorAuthority, err := security.NewAuthenticatedOperatorAuthority("local-operator")
+	if err != nil {
+		return errRequestRejected
+	}
+	server, plane, err := newServerWithProviderAndAuthority(repoRoot, stateRoot, provider, operatorAuthority)
+	if err != nil {
+		return errRequestRejected
+	}
+	operatorServer, err := operator.NewServer(socketPath, key, operatorAuthority.OperatorID, plane.IssueOperatorConfirmation)
+	if err != nil {
+		_ = plane.Close()
+		return errRequestRejected
+	}
+	if err := operatorServer.Start(); err != nil {
+		_ = plane.Close()
+		return errRequestRejected
+	}
+	defer operatorServer.Close()
 	defer func() {
 		_ = plane.Close()
 	}()
@@ -515,5 +562,99 @@ func runWithProvider(ctx context.Context, transport mcp.Transport, repoRoot, sta
 	if errors.Is(err, io.EOF) {
 		return nil
 	}
+	return err
+}
+
+func ensureOperatorKey(stateRoot string) ([]byte, error) {
+	if stateRoot == "" || !filepath.IsAbs(stateRoot) || filepath.Clean(stateRoot) != stateRoot {
+		return nil, fmt.Errorf("invalid state root")
+	}
+	if err := os.MkdirAll(stateRoot, 0o700); err != nil {
+		return nil, errRequestRejected
+	}
+	if err := os.Chmod(stateRoot, 0o700); err != nil {
+		return nil, errRequestRejected
+	}
+	info, err := os.Stat(stateRoot)
+	if err != nil || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+		return nil, errRequestRejected
+	}
+	path := filepath.Join(stateRoot, "operator.key")
+	if info, err := os.Lstat(path); err == nil {
+		if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+			return nil, errRequestRejected
+		}
+		key, readErr := os.ReadFile(path)
+		if readErr != nil || len(key) < 32 {
+			return nil, errRequestRejected
+		}
+		return key, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, errRequestRejected
+	}
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return nil, errRequestRejected
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return nil, errRequestRejected
+	}
+	_, writeErr := file.Write(key)
+	closeErr := file.Close()
+	if writeErr != nil || closeErr != nil {
+		_ = os.Remove(path)
+		return nil, errRequestRejected
+	}
+	return key, nil
+}
+
+func runOperatorApprove(args []string) error {
+	flags := flag.NewFlagSet("operator-approve", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	socket := flags.String("socket", "", "private RepoWorker operator socket")
+	keyFile := flags.String("operator-key-file", "", "private operator key file")
+	operatorID := flags.String("operator-id", "local-operator", "independent operator identity")
+	class := flags.String("class", "destructive", "destructive or publication")
+	ttl := flags.Duration("ttl", 10*time.Minute, "confirmation lifetime")
+	action := flags.String("action", "", "exact approved action digest")
+	operation := flags.String("operation", "", "typed operation shortcut: integrate")
+	repositoryID := flags.String("repository-id", "", "repository identity")
+	principalID := flags.String("principal-id", "", "autonomous principal identity")
+	sessionID := flags.String("session-id", "", "authenticated control-plane session")
+	generationID := flags.String("generation-id", "", "workspace generation")
+	fencing := flags.Uint64("fencing-generation", 0, "workspace fencing generation")
+	candidate := flags.String("candidate-snapshot", "", "candidate snapshot digest")
+	plan := flags.String("plan-digest", "", "verification or operation plan digest")
+	if err := flags.Parse(args); err != nil {
+		return errRequestRejected
+	}
+	if *operation != "" && *operation != "integrate" {
+		return errRequestRejected
+	}
+	if *action == "" && *operation == "integrate" && *plan != "" {
+		digest := sha256.Sum256([]byte("repository.integrate:" + *plan))
+		*action = hex.EncodeToString(digest[:])
+	}
+	if *action == "" || *repositoryID == "" || *principalID == "" || *sessionID == "" || *generationID == "" || *candidate == "" || *plan == "" || *fencing == 0 {
+		return errRequestRejected
+	}
+	keyInfo, err := os.Lstat(*keyFile)
+	if err != nil || !keyInfo.Mode().IsRegular() || keyInfo.Mode().Perm()&0o077 != 0 {
+		return errRequestRejected
+	}
+	key, err := os.ReadFile(*keyFile)
+	if err != nil || len(key) < 32 {
+		return errRequestRejected
+	}
+	confirmationClass := security.ConfirmationClass(*class)
+	if confirmationClass != security.ConfirmationDestructive && confirmationClass != security.ConfirmationPublication {
+		return errRequestRejected
+	}
+	confirmation, err := operator.Approve(context.Background(), *socket, key, *operatorID, security.OperatorConfirmationRequest{Binding: security.ConfirmationBinding{Action: *action, RepositoryID: *repositoryID, PrincipalID: *principalID, SessionID: *sessionID, GenerationID: *generationID, FencingGeneration: *fencing, CandidateSnapshot: *candidate, PlanDigest: *plan}, Class: confirmationClass, TTL: *ttl})
+	if err != nil {
+		return errRequestRejected
+	}
+	_, err = fmt.Fprintln(os.Stdout, confirmation.Token)
 	return err
 }

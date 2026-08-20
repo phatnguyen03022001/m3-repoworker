@@ -2,6 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"math"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -12,6 +16,7 @@ import (
 	"github.com/tienphat/m3-repoworker/internal/publication"
 	"github.com/tienphat/m3-repoworker/internal/repo"
 	m3runtime "github.com/tienphat/m3-repoworker/internal/runtime"
+	"github.com/tienphat/m3-repoworker/internal/security"
 	"github.com/tienphat/m3-repoworker/internal/verify"
 	"github.com/tienphat/m3-repoworker/internal/workspace"
 )
@@ -213,12 +218,13 @@ func m3Tool(name, title, description string, readOnly, idempotent, destructive, 
 
 func newControlPlaneServer(plane *controlplane.Plane) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{Name: "m3-repoworker", Version: "0.4.0"}, nil)
+	installMCPReplayGuard(server, plane)
 
 	// The production server keeps repository access read-only. Candidate edits
 	// are deliberately absent here; they must be performed by an isolated loop
 	// authority in a TaskWorkspace generation.
-	mcp.AddTool(server, m3Tool("repo_status", "Repository status", "Return authenticated control-plane and repository health.", true, true, false, false), func(_ context.Context, _ *mcp.CallToolRequest, _ StatusInput) (*mcp.CallToolResult, StatusOutput, error) {
-		return nil, StatusOutput{Status: "ok"}, nil
+	mcp.AddTool(server, m3Tool("repo_status", "Repository status", "Return authenticated control-plane and repository health.", true, true, false, false), func(_ context.Context, _ *mcp.CallToolRequest, _ StatusInput) (*mcp.CallToolResult, RepoStatusOutput, error) {
+		return nil, RepoStatusOutput{Status: "ok", RepositoryID: plane.RepositoryID, PrincipalID: plane.PrincipalID, SessionID: plane.SessionID}, nil
 	})
 	mcp.AddTool(server, m3Tool("repo_git_status", "Read Git status", "Return typed read-only Git status bound to the opened repository authority.", true, true, false, false), func(ctx context.Context, _ *mcp.CallToolRequest, _ RepoSnapshotInput) (*mcp.CallToolResult, repo.GitStatus, error) {
 		status, err := plane.Repo.GitStatus(ctx)
@@ -248,7 +254,7 @@ func newControlPlaneServer(plane *controlplane.Plane) *mcp.Server {
 		}
 		return nil, manifest, nil
 	})
-	mcp.AddTool(server, m3Tool("repo_verify", "Run fixed repository verification", "Run one allow-listed repository verification preset with bounded output; no client-supplied shell command is accepted.", false, true, true, false), func(ctx context.Context, _ *mcp.CallToolRequest, input RepoVerifyInput) (*mcp.CallToolResult, RepoVerifyOutput, error) {
+	mcp.AddTool(server, m3Tool("repo_verify", "Run fixed repository verification", "Run one allow-listed repository verification preset with bounded output; no client-supplied shell command is accepted.", true, true, false, false), func(ctx context.Context, _ *mcp.CallToolRequest, input RepoVerifyInput) (*mcp.CallToolResult, RepoVerifyOutput, error) {
 		if err := plane.Tasks.RequireMain(ctx); err != nil {
 			return nil, RepoVerifyOutput{}, safeToolError(err)
 		}
@@ -457,3 +463,90 @@ func newControlPlaneServer(plane *controlplane.Plane) *mcp.Server {
 
 	return server
 }
+
+var mutatingMCPTools = map[string]struct{}{
+	"workspace_create":    {},
+	"workspace_discard":   {},
+	"workspace_integrate": {},
+	"runtime_create":      {},
+	"runtime_start":       {},
+	"runtime_stop":        {},
+	"process_run":         {},
+	"process_signal":      {},
+	"process_cancel":      {},
+	"verification_run":    {},
+	"run_create":          {},
+	"run_event_append":    {},
+	"loop_start":          {},
+	"loop_resume":         {},
+	"publication_execute": {},
+}
+
+func installMCPReplayGuard(server *mcp.Server, plane *controlplane.Plane) {
+	server.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, request mcp.Request) (mcp.Result, error) {
+			if method != "tools/call" {
+				return next(ctx, method, request)
+			}
+			call, ok := request.(*mcp.CallToolRequest)
+			if !ok || call.Params == nil {
+				return next(ctx, method, request)
+			}
+			if _, mutating := mutatingMCPTools[call.Params.Name]; !mutating {
+				return next(ctx, method, request)
+			}
+			requestID, sequence, ok := mcpReplayMetadata(call.Params.Meta)
+			if !ok {
+				return nil, errRequestRejected
+			}
+			if call.Session == nil {
+				return nil, errRequestRejected
+			}
+			mcpSessionID := call.Session.ID()
+			if mcpSessionID == "" {
+				// Stdio has no protocol session header. The SDK session object is
+				// still the actual logical transport session for this connection.
+				mcpSessionID = fmt.Sprintf("stdio:%p", call.Session)
+			}
+			if err := plane.AcceptMCPRequest(ctx, mcpSessionID, requestID, sequence); err != nil {
+				return nil, errRequestRejected
+			}
+			return next(ctx, method, request)
+		}
+	})
+}
+
+func mcpReplayMetadata(meta mcp.Meta) (string, uint64, bool) {
+	requestID, ok := meta[mcpSecurityRequestIDKey].(string)
+	if !ok || len(requestID) == 0 || len(requestID) > 128 || strings.ContainsAny(requestID, "\x00\r\n/\\") {
+		return "", 0, false
+	}
+	var sequence uint64
+	switch value := meta[mcpSecurityRequestSequenceKey].(type) {
+	case int:
+		if value > 0 {
+			sequence = uint64(value)
+		}
+	case int64:
+		if value > 0 {
+			sequence = uint64(value)
+		}
+	case uint64:
+		sequence = value
+	case float64:
+		if value > 0 && value <= math.MaxInt64 && math.Trunc(value) == value {
+			sequence = uint64(value)
+		}
+	case json.Number:
+		parsed, err := value.Int64()
+		if err == nil && parsed > 0 {
+			sequence = uint64(parsed)
+		}
+	}
+	return requestID, sequence, sequence != 0
+}
+
+const (
+	mcpSecurityRequestIDKey       = security.MCPRequestIDMetaKey
+	mcpSecurityRequestSequenceKey = security.MCPRequestSequenceMetaKey
+)

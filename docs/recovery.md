@@ -32,3 +32,10 @@ remain disabled by default and every execute request needs scoped operator
 confirmation. The real gate runs the Apple lifecycle and M3 E2E tests as
 required tests; missing prerequisites are `NOT RUN` failures, never GREEN
 skips.
+
+The operator socket and replay cache are deliberately process-local recovery
+boundaries. Closing/reopening creates a new authenticated control-plane session
+and a new request replay cache; old confirmation records and old request
+identities are not resurrected. The operator must re-plan and approve again
+after restart. A replayed request ID is rejected even if it is presented with a
+different MCP session, principal, or transport binding.

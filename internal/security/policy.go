@@ -151,6 +151,47 @@ type OperatorAuthority interface {
 	AuthorizeOperator(context.Context, OperatorConfirmationRequest) error
 }
 
+type authenticatedOperatorContextKey struct{}
+
+// WithOperatorAuthentication is used only by a separately authenticated
+// operator channel after it has verified its private-channel credential. No
+// MCP handler calls this function, and the autonomous surface has no access
+// to the operator channel.
+func WithOperatorAuthentication(ctx context.Context, operatorID string) context.Context {
+	if ctx == nil || !validID(operatorID) {
+		return nil
+	}
+	return context.WithValue(ctx, authenticatedOperatorContextKey{}, operatorID)
+}
+
+// AuthenticatedOperatorAuthority accepts approval requests only from the
+// private operator channel's authenticated context. Its identity is
+// independent from the autonomous MCP principal.
+type AuthenticatedOperatorAuthority struct {
+	OperatorID string
+}
+
+func NewAuthenticatedOperatorAuthority(operatorID string) (AuthenticatedOperatorAuthority, error) {
+	if !validID(operatorID) {
+		return AuthenticatedOperatorAuthority{}, ErrDenied
+	}
+	return AuthenticatedOperatorAuthority{OperatorID: operatorID}, nil
+}
+
+func (a AuthenticatedOperatorAuthority) AuthorizeOperator(ctx context.Context, request OperatorConfirmationRequest) error {
+	if ctx == nil {
+		return ErrDenied
+	}
+	authenticatedID, ok := ctx.Value(authenticatedOperatorContextKey{}).(string)
+	if !ok || authenticatedID != a.OperatorID || !validID(a.OperatorID) || !validConfirmationBinding(request.Binding) || request.Binding.PrincipalID == a.OperatorID {
+		return ErrDenied
+	}
+	if request.Class != ConfirmationDestructive && request.Class != ConfirmationPublication {
+		return ErrDenied
+	}
+	return nil
+}
+
 // ExplicitOperatorAuthority is useful for a private local admin adapter and
 // tests. It is never installed by Open unless configured.
 type ExplicitOperatorAuthority struct {

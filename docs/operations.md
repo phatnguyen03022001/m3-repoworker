@@ -53,6 +53,56 @@ The connector command must carry an explicit trusted principal (the provided
 tunnel script uses `local-tunnel`), or a signed authenticated transport header
 must be supplied. RepoWorker never accepts identity from an MCP tool argument.
 
+## Operator confirmation channel
+
+The production binary starts a separate operator-only Unix socket at
+`<state-dir>/operator.sock` and creates `<state-dir>/operator.key`. The state
+directory is `0700`, the key and socket are `0600`, and the key is independent
+of the autonomous MCP principal. No MCP tool can issue a confirmation and
+`confirmation_issue` is intentionally absent from the production surface.
+
+After `repo_status`, `workspace_status`, and
+`workspace_integration_plan` have returned the current repository, principal,
+session, generation, fencing, candidate, and plan identities, an operator can
+approve the pending integration with the dedicated CLI:
+
+```sh
+./bin/repoworker operator-approve \
+  -socket "$REPOWORKER_STATE_DIR/operator.sock" \
+  -operator-key-file "$REPOWORKER_STATE_DIR/operator.key" \
+  -operator-id local-operator \
+  -class destructive \
+  -operation integrate \
+  -repository-id "$REPOSITORY_ID" \
+  -principal-id "$PRINCIPAL_ID" \
+  -session-id "$SESSION_ID" \
+  -generation-id "$GENERATION_ID" \
+  -fencing-generation "$FENCING_GENERATION" \
+  -candidate-snapshot "$CANDIDATE_SNAPSHOT" \
+  -plan-digest "$PLAN_DIGEST"
+```
+
+The command prints the opaque one-time token to stdout for the operator to
+submit to `workspace_integrate`; it never logs the token. `-operation
+integrate` derives the exact action digest from the plan digest. The socket
+authenticates the operator with the private HMAC key and binds the confirmation
+to action, repository, principal, session, generation, fencing generation,
+candidate snapshot, plan digest, class, and expiry. A scope change, restart,
+expiry, replay, or concurrent second consume is rejected.
+
+Mutating MCP calls must carry the SDK request metadata keys
+`repoworker/request_id` and `repoworker/request_sequence` in
+`CallToolParams._meta`. The bounded process-local cache rejects duplicate
+request IDs in any bound session and duplicate sequences in one MCP session.
+Restart creates a fresh authenticated control-plane session and replay cache;
+callers must establish a fresh MCP session and request sequence. The signed
+HTTP credential nonce is a credential-uniqueness marker, not a consumed
+transport replay cache.
+
+`repo_git_status` is read-only and bounded: it returns deterministic sorted
+path summaries, `changed_count`, and `truncated`; oversized or malformed Git
+output fails closed.
+
 Keep state outside the live checkout. Never reset or overwrite the live
 repository to recover a task. If startup rejects identity, integrity, or
 recovery, preserve the state directory and inspect it. Local commits are on

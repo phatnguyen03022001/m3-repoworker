@@ -3,6 +3,7 @@ package repo
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -73,7 +74,7 @@ func TestGitStatusIsTypedDeterministicAndReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GitStatus(clean) error = %v", err)
 	}
-	if clean.Branch != "main" || len(clean.Head) != 40 || clean.Dirty || len(clean.ChangedPaths) != 0 || clean.RepositoryIdentity == "" || clean.TrustedRoot != clean.RepositoryIdentity {
+	if clean.Branch != "main" || len(clean.Head) != 40 || clean.Dirty || clean.ChangedCount != 0 || clean.Truncated || len(clean.ChangedPaths) != 0 || clean.RepositoryIdentity == "" || clean.TrustedRoot != clean.RepositoryIdentity {
 		t.Fatalf("clean GitStatus() = %#v", clean)
 	}
 	if err := os.WriteFile(filepath.Join(root, "z.txt"), []byte("z\n"), 0o600); err != nil {
@@ -86,8 +87,81 @@ func TestGitStatusIsTypedDeterministicAndReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GitStatus(dirty) error = %v", err)
 	}
-	if !dirty.Dirty || strings.Join(dirty.ChangedPaths, ",") != "?? a.txt,?? z.txt" {
+	if !dirty.Dirty || dirty.ChangedCount != 2 || dirty.Truncated || strings.Join(dirty.ChangedPaths, ",") != "?? a.txt,?? z.txt" {
 		t.Fatalf("dirty GitStatus() = %#v, want deterministic changed paths", dirty)
+	}
+}
+
+func TestGitStatusRenameAndBoundedChangedPathsWithoutMutation(t *testing.T) {
+	root := t.TempDir()
+	for _, args := range [][]string{{"init", "-b", "main"}, {"config", "user.name", "RepoWorker Test"}, {"config", "user.email", "repoworker@example.invalid"}, {"commit", "--allow-empty", "-m", "initial"}} {
+		if output, err := exec.Command("git", append([]string{"-C", root}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+	writeTestFile(t, filepath.Join(root, "old.txt"), "rename me\n")
+	if output, err := exec.Command("git", "-C", root, "add", "old.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v: %s", err, output)
+	}
+	if output, err := exec.Command("git", "-C", root, "commit", "-m", "add old file").CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v: %s", err, output)
+	}
+	if output, err := exec.Command("git", "-C", root, "mv", "old.txt", "renamed.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git mv: %v: %s", err, output)
+	}
+	indexBefore, err := os.ReadFile(filepath.Join(root, ".git", "index"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer workspace.Close()
+	rename, err := workspace.GitStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GitStatus(rename) error = %v", err)
+	}
+	if !rename.Dirty || rename.ChangedCount != 1 || rename.Truncated || len(rename.ChangedPaths) != 1 || !strings.HasPrefix(rename.ChangedPaths[0], "R  renamed.txt") {
+		t.Fatalf("rename GitStatus() = %#v", rename)
+	}
+	indexAfter, err := os.ReadFile(filepath.Join(root, ".git", "index"))
+	if err != nil || string(indexAfter) != string(indexBefore) {
+		t.Fatalf("GitStatus mutated the Git index: read error=%v equal=%v", err, string(indexAfter) == string(indexBefore))
+	}
+
+	for index := 0; index < maxGitChangedPathEntries+40; index++ {
+		writeTestFile(t, filepath.Join(root, "many", fmt.Sprintf("file-%04d.txt", index)), "x\n")
+	}
+	bounded, err := workspace.GitStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GitStatus(many) error = %v", err)
+	}
+	if !bounded.Dirty || bounded.ChangedCount != maxGitChangedPathEntries+41 || !bounded.Truncated || len(bounded.ChangedPaths) > maxGitChangedPathEntries {
+		t.Fatalf("bounded GitStatus() = %#v", bounded)
+	}
+	returnedBytes := 0
+	for _, path := range bounded.ChangedPaths {
+		returnedBytes += len(path)
+	}
+	if returnedBytes > maxGitChangedPathBytes {
+		t.Fatalf("returned changed paths = %d bytes, want <= %d", returnedBytes, maxGitChangedPathBytes)
+	}
+	again, err := workspace.GitStatus(context.Background())
+	if err != nil || strings.Join(again.ChangedPaths, "\x00") != strings.Join(bounded.ChangedPaths, "\x00") || again.ChangedCount != bounded.ChangedCount || again.Truncated != bounded.Truncated {
+		t.Fatalf("bounded GitStatus is not deterministic: first=%#v second=%#v error=%v", bounded, again, err)
+	}
+}
+
+func TestParsePorcelainStatusRejectsMalformedOutput(t *testing.T) {
+	for _, output := range [][]byte{
+		[]byte("not a branch\x00?? file\x00"),
+		[]byte("## main\x00X? file\x00"),
+		[]byte("## main\x00?? bad\npath\x00"),
+	} {
+		if _, _, _, err := parsePorcelainStatus(output); !errors.Is(err, ErrRejected) {
+			t.Fatalf("parsePorcelainStatus(%q) error = %v, want rejection", output, err)
+		}
 	}
 }
 

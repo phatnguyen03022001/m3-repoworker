@@ -9,7 +9,9 @@ mode requires an explicit trusted principal configuration. Missing identity,
 forged tool identity, transport mismatch, expiry, and replay fail closed.
 The resulting session binds principal, authentication context, repository, and
 filesystem identity. Requests use nonce rotation, trusted-main binding, typed
-capabilities, and one-time confirmation classes.
+capabilities, and one-time confirmation classes. The signed credential nonce
+identifies a unique credential; same-session MCP request replay is separately
+checked from SDK request metadata and a bounded cache.
 
 Workspace generations reject symlinks and live/cache overlap. Integration
 paths are repository-relative and use descriptor-relative no-follow writes,
@@ -25,10 +27,23 @@ branch switching, or worktree creation. Public output omits host paths and
 uses the stable /workspace mount.
 
 Destructive integration/publication confirmation is issued only by an
-operator-only authority (private CLI/admin socket with its own authentication),
-then bound to exact action, repository, principal, session, generation fence,
-candidate snapshot, plan digest, expiry, and one-time consumption. Autonomous
-MCP callers can request a plan but cannot mint their own approval.
+operator-only authority implemented by the private Unix socket and dedicated
+`operator-approve` CLI. Its `0700` state directory, `0600` key/socket, and
+HMAC-authenticated operator identity are independent from the autonomous MCP
+principal. The record is bound to exact action, repository, principal, session,
+generation fence, candidate snapshot, plan digest, expiry, and one-time atomic
+consumption. Autonomous MCP callers can request a plan but cannot reach or
+invoke the approval authority.
+
+The typed Git status operation runs fixed read-only Git arguments with a
+64-KiB stdout ceiling, 256 returned path ceiling, and 16-KiB returned path
+summary ceiling. It sorts paths before truncation and fails closed on malformed
+or oversized output; it never writes the index or worktree.
+
+`repo_verify` is also a fixed, idempotent read-only operation from the MCP
+policy perspective: its allow-listed verification runs use bounded output and
+do not alter the repository authority. The true state-changing MCP operations
+are guarded by request-level replay protection.
 
 Apple runtime defaults to --network none, mounts only the isolated workspace,
 applies CPU/RAM limits, and recovers active records before new mutation.

@@ -110,13 +110,30 @@ loop_start loop_resume loop_status
 publication_plan publication_execute
 ```
 
-`repo_git_status` là read-only và trả repository identity, trusted root
-identity, branch, full HEAD SHA, dirty state, và changed paths. Không có
+`repo_status` trả các opaque repository/principal/session identities cần cho
+operator binding; `repo_git_status` là read-only và trả repository identity,
+trusted root identity, branch, full HEAD SHA, dirty state, changed paths,
+`changed_count`, và `truncated` trong giới hạn cố định. Không có
 `confirmation_issue`, client shell, host execution, arbitrary file mutation,
 branch switching, hay worktree creation. Confirmation được cấp qua
 operator-only authority riêng và không bao giờ qua autonomous MCP.
 Candidate edit chỉ xảy ra trong TaskWorkspace đã lease và qua autonomous loop
 bị giới hạn.
+
+Production operator approval dùng `<state-dir>/operator.sock` (`0600`) và
+`<state-dir>/operator.key` (`0600`) trong state directory (`0700`), qua lệnh
+`./bin/repoworker operator-approve`. Xem [docs/operations.md](docs/operations.md)
+để lấy binding từ `repo_status`, `workspace_status`, và plan rồi cấp token cho
+`workspace_integrate`. Socket bind action, repository, principal, session,
+generation, fencing, candidate snapshot, plan digest, expiry và one-time
+consumption; replay, scope change, restart và concurrent consume đều fail
+closed.
+
+Mutating MCP calls carry `repoworker/request_id` and
+`repoworker/request_sequence` in the SDK `_meta`; the bounded cache rejects
+same-request replay. A restart starts a fresh authenticated session/cache and
+requires a fresh MCP session. The signed HTTP nonce marks credential
+uniqueness; it is not itself the consumed request replay cache.
 
 Verification bind repository, candidate snapshot, environment, và policy.
 MCP output dùng opaque IDs và `/workspace`; không trả về state path hay spill

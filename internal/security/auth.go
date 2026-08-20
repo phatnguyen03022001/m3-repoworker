@@ -79,7 +79,9 @@ func (p TrustedPrincipalProvider) Authenticate(ctx context.Context, metadata Tra
 
 // SignedHeaderPrincipalProvider validates a short-lived HMAC credential in an
 // HTTP header. The credential binds the principal and MCP transport session;
-// the raw credential is never returned, logged, or persisted.
+// its nonce marks credential uniqueness but is not a consumed replay cache.
+// The raw credential is never returned, logged, or persisted. Request-level
+// replay is enforced separately by the MCP receiving boundary.
 type SignedHeaderPrincipalProvider struct {
 	Key        []byte
 	HeaderName string

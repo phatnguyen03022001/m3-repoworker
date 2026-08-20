@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -186,6 +187,10 @@ func TestProductionMCPToolSurface(t *testing.T) {
 	if gitStatusTool == nil || gitStatusTool.Annotations == nil || !gitStatusTool.Annotations.ReadOnlyHint || !gitStatusTool.Annotations.IdempotentHint || gitStatusTool.Annotations.DestructiveHint == nil || *gitStatusTool.Annotations.DestructiveHint || gitStatusTool.Annotations.OpenWorldHint == nil || *gitStatusTool.Annotations.OpenWorldHint {
 		t.Errorf("repo_git_status annotations = %#v, want read-only, idempotent, non-destructive, closed-world", gitStatusTool)
 	}
+	verifyTool := toolByName["repo_verify"]
+	if verifyTool == nil || verifyTool.Annotations == nil || !verifyTool.Annotations.ReadOnlyHint || !verifyTool.Annotations.IdempotentHint || verifyTool.Annotations.DestructiveHint == nil || *verifyTool.Annotations.DestructiveHint || verifyTool.Annotations.OpenWorldHint == nil || *verifyTool.Annotations.OpenWorldHint {
+		t.Errorf("repo_verify annotations = %#v, want read-only, idempotent, non-destructive, closed-world", verifyTool)
+	}
 	gitResult, err := clientSession.CallTool(context.Background(), &mcp.CallToolParams{Name: "repo_git_status"})
 	if err != nil || gitResult.IsError {
 		t.Fatalf("repo_git_status call = %#v, %v", gitResult, err)
@@ -200,6 +205,56 @@ func TestProductionServerRejectsMissingAuthenticationProvider(t *testing.T) {
 	root := t.TempDir()
 	if _, _, err := newServer(root, t.TempDir()); err == nil {
 		t.Fatal("production server opened without an explicit authentication provider")
+	}
+}
+
+func TestMCPMutatingRequestReplayRejectedAtRequestBoundary(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "go.mod"), "module example.invalid/replay\n\ngo 1.26.6\n")
+	writeFile(t, filepath.Join(root, "main.go"), "package main\n\nfunc main() {}\n")
+	for _, args := range [][]string{
+		{"init", "-b", "main"},
+		{"config", "user.name", "RepoWorker Test"},
+		{"config", "user.email", "repoworker@example.invalid"},
+		{"add", "."},
+		{"commit", "-m", "initial"},
+	} {
+		if output, err := exec.Command("git", append([]string{"-C", root}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+	server, plane, err := newServerWithProvider(root, t.TempDir(), testPrincipalProvider(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = plane.Close() })
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(context.Background(), serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = serverSession.Close() })
+	client := mcp.NewClient(&mcp.Implementation{Name: "replay-test-client", Version: "0.0.0"}, nil)
+	clientSession, err := client.Connect(context.Background(), clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = clientSession.Close() })
+	request := &mcp.CallToolParams{Meta: mcp.Meta{security.MCPRequestIDMetaKey: "workspace-create-1", security.MCPRequestSequenceMetaKey: uint64(1)}, Name: "workspace_create", Arguments: map[string]any{"task_id": "replay-task"}}
+	first, err := clientSession.CallTool(context.Background(), request)
+	if err != nil || first.IsError {
+		t.Fatalf("first mutating request = %#v, error = %v", first, err)
+	}
+	firstOutput := structuredMap(t, first)
+	if firstOutput["generation_id"] == "" {
+		t.Fatalf("first workspace output = %#v", firstOutput)
+	}
+	second, err := clientSession.CallTool(context.Background(), request)
+	if err == nil && (second == nil || !second.IsError) {
+		t.Fatalf("replayed mutating request = %#v, error = %v; want rejection", second, err)
+	}
+	if _, statusErr := plane.WorkspaceStatus(context.Background(), firstOutput["generation_id"].(string)); statusErr != nil {
+		t.Fatalf("first workspace disappeared after replay rejection: %v", statusErr)
 	}
 }
 
@@ -234,8 +289,8 @@ func TestProductionRepoVerifyPresetsSequentially(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = clientSession.Close() })
-	for _, check := range []string{"fmt", "test", "test-race", "vet", "mcp-integration", "verify"} {
-		result, err := clientSession.CallTool(context.Background(), &mcp.CallToolParams{Name: "repo_verify", Arguments: map[string]any{"check": check}})
+	for index, check := range []string{"fmt", "test", "test-race", "vet", "mcp-integration", "verify"} {
+		result, err := clientSession.CallTool(context.Background(), &mcp.CallToolParams{Meta: mcp.Meta{security.MCPRequestIDMetaKey: fmt.Sprintf("preset-%s", check), security.MCPRequestSequenceMetaKey: uint64(index + 1)}, Name: "repo_verify", Arguments: map[string]any{"check": check}})
 		if err != nil || result.IsError {
 			t.Fatalf("repo_verify(%s) result = %#v, error = %v", check, result, err)
 		}
@@ -267,7 +322,13 @@ func TestRunTreatsEOFAsCleanShutdown(t *testing.T) {
 		Reader: io.NopCloser(strings.NewReader("")),
 		Writer: nopWriteCloser{Writer: io.Discard},
 	}
-	if err := runWithProvider(context.Background(), transport, root, t.TempDir(), testPrincipalProvider(t)); err != nil {
+	stateRoot := t.TempDir()
+	socketRoot, err := os.MkdirTemp("/private/tmp", "rwop-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	if err := runWithProviderAndSocket(context.Background(), transport, root, stateRoot, testPrincipalProvider(t), filepath.Join(socketRoot, "operator.sock")); err != nil {
 		t.Fatalf("run() error = %v, want nil", err)
 	}
 }

@@ -94,7 +94,14 @@ func (p *Plane) PublicationPlan(ctx context.Context, generationID, planDigest st
 	request.Mode = publication.ModePlan
 	request.DryRun = false
 	request.ConfirmationToken = ""
-	return p.Publication.Publish(ctx, candidate, request)
+	result, err := p.Publication.Publish(ctx, candidate, request)
+	if err != nil {
+		return publication.Result{}, err
+	}
+	if record, statusErr := p.WorkspaceStatus(ctx, generationID); statusErr == nil {
+		p.rememberConfirmationBinding(security.ConfirmationPublication, p.publicationConfirmationBinding(generationID, planDigest, record, request))
+	}
+	return result, nil
 }
 
 func (p *Plane) PublicationExecute(ctx context.Context, generationID, planDigest string, request publication.Request) (publication.Result, error) {
@@ -134,7 +141,9 @@ func (p *Plane) PublicationConfirmationBinding(ctx context.Context, generationID
 	if _, _, err := p.publicationCandidate(ctx, generationID, planDigest); err != nil {
 		return security.ConfirmationBinding{}, err
 	}
-	return p.publicationConfirmationBinding(generationID, planDigest, record, request), nil
+	binding := p.publicationConfirmationBinding(generationID, planDigest, record, request)
+	p.rememberConfirmationBinding(security.ConfirmationPublication, binding)
+	return binding, nil
 }
 
 func (p *Plane) publicationConfirmationBinding(generationID, planDigest string, record WorkspaceRecord, request publication.Request) security.ConfirmationBinding {

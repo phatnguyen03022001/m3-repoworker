@@ -34,4 +34,7 @@ events/checkpoints → autonomous loop → optional verified publication`.
   cache root.
 - The exact production MCP surface is closed-world and includes typed
   `repo_git_status` without `confirmation_issue`.
+- Operator confirmation uses an authenticated private socket/CLI outside MCP;
+  mutating MCP request identity is replay-protected at the SDK receiving
+  boundary; Git status output is bounded and deterministic.
 - README and operational docs describe the actual commands and limitations.
