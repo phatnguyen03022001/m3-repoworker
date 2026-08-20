@@ -21,7 +21,15 @@ MCP adapter. It includes:
   stop/delete recovery, fresh lease fencing, deterministic environment
   rehydration, and runtime re-provision/rebind;
 - typed read-only `repo_git_status` and an exact 31-tool production MCP
-  surface with no autonomous confirmation minting.
+  surface with no autonomous confirmation minting; bounded Git output includes
+  deterministic changed-path truncation and no index/worktree mutation;
+- a real private operator Unix socket and `operator-approve` CLI with private
+  `0700`/`0600` state permissions, independent HMAC operator authentication,
+  pending-plan binding, atomic one-time consumption, and restart invalidation;
+- MCP receiving-boundary replay protection using SDK `_meta` request identity,
+  SDK session handle, authenticated transport/session/principal binding, and a
+  bounded cache. Signed HTTP credential nonces are documented as uniqueness
+  markers rather than consumed transport replay state.
 
 Production MCP has no generic shell, host_exec, arbitrary patch, file creation,
 branch switching, worktree, or autonomous confirmation-issue tools. Public
@@ -45,6 +53,10 @@ resource evidence, supervised execution, stale leases, and crash recovery.
 The E2E test covers workspace, runtime, process, bound verification, durable
 loop, publication plan, confirmation-gated integration, live-repository
 isolation, and a close/reopen loop resume with runtime recreation.
+The operator-channel tests cover production pending approval, self-approval,
+every binding dimension, expiry, signed-wire replay, concurrent consume, and
+session invalidation after reopen. The MCP-level test replays one logical
+mutating request and observes no duplicate workspace side effect.
 
 ## Known limitations
 
@@ -55,11 +67,13 @@ isolation, and a close/reopen loop resume with runtime recreation.
   enabled in the composition root; verification images must already contain
   the required toolchain.
 - The local tunnel is an external connector process. If it caches an older MCP
-  schema, reconnect/re-add the connector and open a new session.
+  schema, reconnect/re-add the connector and open a new session. The final
+  fresh session used for this checkpoint exposed exactly the 31 tools listed in
+  README, including `repo_git_status`, and no `confirmation_issue`.
 
 ## Current source checkpoint
 
 The verified implementation checkpoint is local commit
-`e0a996d5f24cbad5c003f4094cb1b77429ea8f4d` on `main`, descended from the
-audited source HEAD `72a2c8c7fd18a496aad368aa4d6542bb7af5080f`. No remote push,
-PR, release, or deployment is part of this work.
+`26ab3aa45ebca6eee6f5c5596f670464b85a6b98` on `main`, descended from the
+prior local source checkpoint `02a44737392bf7b9d6e1b90de6da3e9439fbfa3f`.
+No remote push, PR, release, or deployment is part of this work.
