@@ -21,6 +21,8 @@ The current M3.1 substrate consists of:
 - `internal/runtime`: lifecycle manager with Apple container primary adapter,
   Lima fallback/test adapter, isolated workspace mount binding, and crash
   cleanup.
+- `internal/scheduler`: bounded DAG scheduler with CPU/RAM admission, weighted
+  fairness, quotas, backpressure, cancellation, and host-pressure response.
 
 M3.2–M3.10 will bind authenticated principals, capabilities, process/runtime
 backends, resource admission, verification, events, autonomous-loop state,

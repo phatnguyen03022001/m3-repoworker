@@ -72,3 +72,19 @@
   host-pressure response.
 - Exact next action: define deterministic resource admission and scheduler
   contracts, then add stress/race/DAG tests.
+
+## M3.5 — IN PROGRESS
+
+- State: resource-aware scheduler implemented locally; verification and
+  checkpoint pending.
+- Scope: CPU/RAM admission, weighted fair ready selection, dependency DAG,
+  bounded submission/backpressure, task/runtime quotas, controlled
+  concurrency, errgroup-equivalent cancellation propagation, and host
+  pressure response.
+- Tests: scheduler tests cover DAG ordering, resource limits, cycle rejection,
+  backpressure, sibling cancellation, host pressure, unschedulable jobs, and
+  submitted queue execution.
+- Decisions: see `docs/adr/0005-m3.5-resource-aware-scheduler.md`.
+- Remaining: run full verification and checkpoint on `main`.
+- Exact next action: run `make verify`, `govulncheck ./...`, inspect the diff,
+  and commit `m3.5: resource-aware scheduler`.
