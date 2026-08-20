@@ -13,7 +13,15 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/tienphat/m3-repoworker/internal/repo"
 	"github.com/tienphat/m3-repoworker/internal/taskstate"
+	"github.com/tienphat/m3-repoworker/internal/verify"
 )
+
+func TestMain(m *testing.M) {
+	if preset, ok := verify.InternalRequest(); ok {
+		os.Exit(verify.RunInternal(preset))
+	}
+	os.Exit(m.Run())
+}
 
 func TestRepoStatusTool(t *testing.T) {
 	t.Parallel()
@@ -25,7 +33,7 @@ func TestRepoStatusTool(t *testing.T) {
 	}
 	ctx := context.Background()
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
-	server := newServerForComponents(workspace, &fakeTaskManager{})
+	server := newServerForComponents(workspace, &fakeTaskManager{}, "")
 	serverSession, err := server.Connect(ctx, serverTransport, nil)
 	if err != nil {
 		t.Fatalf("connect server: %v", err)
@@ -288,32 +296,32 @@ func TestMCPMutationsFailClosedWhenCheckoutLeavesMain(t *testing.T) {
 	}
 }
 
-func TestVerificationPresetAndEnvironmentAreFixed(t *testing.T) {
-	cases := map[string]string{
-		"fmt":             "fmt-check",
-		"test":            "test",
-		"test-race":       "test-race",
-		"vet":             "vet",
-		"mcp-integration": "mcp-integration",
-		"verify":          "verify",
-	}
-	for check, wantTarget := range cases {
-		target, timeout, ok := verificationPreset(check)
-		if !ok || target != wantTarget || timeout <= 0 {
-			t.Fatalf("verificationPreset(%q) = (%q, %v, %v)", check, target, timeout, ok)
-		}
-	}
-	if _, _, ok := verificationPreset("shell"); ok {
-		t.Fatal("verificationPreset(shell) unexpectedly accepted arbitrary command")
-	}
+func TestMCPVerificationReturnsBoundedSanitizedDiagnostic(t *testing.T) {
+	root := t.TempDir()
+	makefile := "fmt-check:\n\t@printf 'failure in " + root + "\\n'; exit 7\n"
+	writeFile(t, filepath.Join(root, "Makefile"), makefile)
 
-	offline := strings.Join(fixedExecutionEnv(false), "\n")
-	if !strings.Contains(offline, "GOPROXY=off") || strings.Contains(offline, "GITHUB_TOKEN=") || strings.Contains(offline, "SSH_AUTH_SOCK=") {
-		t.Fatalf("offline execution environment is not confined: %q", offline)
+	client := connectClient(t, root, &fakeTaskManager{})
+	result, err := client.CallTool(context.Background(), &mcp.CallToolParams{Name: "repo_verify", Arguments: map[string]any{"check": "fmt"}})
+	if err != nil || result.IsError {
+		t.Fatalf("repo_verify result = %#v, error = %v", result, err)
 	}
-	maintenance := strings.Join(fixedExecutionEnv(true), "\n")
-	if !strings.Contains(maintenance, "GOPROXY=https://proxy.golang.org") || strings.Contains(maintenance, "GOPRIVATE="+os.Getenv("GOPRIVATE")) && os.Getenv("GOPRIVATE") != "" {
-		t.Fatalf("maintenance execution environment is not fixed: %q", maintenance)
+	output := structuredMap(t, result)
+	if output["passed"] != false || output["exit_code"] != float64(2) {
+		t.Fatalf("repo_verify outcome = %#v", output)
+	}
+	if output["failure_stage"] != "execution" {
+		t.Fatalf("failure stage = %#v, want execution", output["failure_stage"])
+	}
+	diagnostic, ok := output["diagnostic"].(string)
+	if !ok || diagnostic == "" {
+		t.Fatalf("diagnostic = %#v, want bounded text", output["diagnostic"])
+	}
+	if len(diagnostic) > verify.DiagnosticLimit {
+		t.Fatalf("diagnostic length = %d", len(diagnostic))
+	}
+	if strings.Contains(diagnostic, root) || strings.Contains(diagnostic, "/dev/fd/") {
+		t.Fatalf("diagnostic leaked a path: %q", diagnostic)
 	}
 }
 
@@ -357,7 +365,7 @@ func connectClient(t *testing.T, root string, tasks taskstate.StateStore) *mcp.C
 	if err != nil {
 		t.Fatalf("repo.New() error = %v", err)
 	}
-	server := newServerForComponents(workspace, tasks)
+	server := newServerForComponents(workspace, tasks, "")
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
 	serverSession, err := server.Connect(ctx, serverTransport, nil)
 	if err != nil {

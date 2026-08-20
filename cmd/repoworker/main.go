@@ -4,18 +4,13 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"io"
-	"log"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"syscall"
-	"time"
-
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/tienphat/m3-repoworker/internal/repo"
 	"github.com/tienphat/m3-repoworker/internal/taskstate"
-	"golang.org/x/sys/unix"
+	"github.com/tienphat/m3-repoworker/internal/verify"
+	"io"
+	"log"
+	"os"
 )
 
 type StatusInput struct{}
@@ -78,18 +73,24 @@ type RepoVerifyInput struct {
 }
 
 type RepoVerifyOutput struct {
-	Check    string `json:"check"`
-	Passed   bool   `json:"passed"`
-	ExitCode int    `json:"exit_code"`
-	TimedOut bool   `json:"timed_out"`
+	Check        string `json:"check"`
+	Passed       bool   `json:"passed"`
+	ExitCode     int    `json:"exit_code"`
+	TimedOut     bool   `json:"timed_out"`
+	FailureStage string `json:"failure_stage,omitempty"`
+	Diagnostic   string `json:"diagnostic,omitempty"`
+	Truncated    bool   `json:"truncated,omitempty"`
 }
 
 type GoModTidyInput struct{}
 
 type GoModTidyOutput struct {
-	Completed bool `json:"completed"`
-	ExitCode  int  `json:"exit_code"`
-	TimedOut  bool `json:"timed_out"`
+	Completed    bool   `json:"completed"`
+	ExitCode     int    `json:"exit_code"`
+	TimedOut     bool   `json:"timed_out"`
+	FailureStage string `json:"failure_stage,omitempty"`
+	Diagnostic   string `json:"diagnostic,omitempty"`
+	Truncated    bool   `json:"truncated,omitempty"`
 }
 
 type TaskCreateInput struct {
@@ -111,116 +112,6 @@ var errRequestRejected = errors.New("request rejected")
 
 func boolPtr(v bool) *bool { return &v }
 
-type fixedCommandOutcome struct {
-	exitCode int
-	timedOut bool
-}
-
-func verificationPreset(check string) (string, time.Duration, bool) {
-	switch check {
-	case "fmt":
-		return "fmt-check", 2 * time.Minute, true
-	case "test":
-		return "test", 5 * time.Minute, true
-	case "test-race":
-		return "test-race", 10 * time.Minute, true
-	case "vet":
-		return "vet", 5 * time.Minute, true
-	case "mcp-integration":
-		return "mcp-integration", 5 * time.Minute, true
-	case "verify":
-		return "verify", 15 * time.Minute, true
-	default:
-		return "", 0, false
-	}
-}
-
-func resolveFixedExecutable(name string) (string, error) {
-	path, err := exec.LookPath(name)
-	if err != nil || !filepath.IsAbs(path) {
-		return "", errRequestRejected
-	}
-	path, err = filepath.EvalSymlinks(path)
-	if err != nil || !filepath.IsAbs(path) {
-		return "", errRequestRejected
-	}
-	return path, nil
-}
-
-func fixedExecutionEnv(network bool) []string {
-	env := []string{
-		"PATH=" + os.Getenv("PATH"),
-		"LC_ALL=C",
-		"LANG=C",
-		"GIT_CONFIG_NOSYSTEM=1",
-		"GIT_CONFIG_GLOBAL=/dev/null",
-		"GIT_TERMINAL_PROMPT=0",
-		"GIT_OPTIONAL_LOCKS=0",
-		"GOCACHE=/dev/fd/3/.cache/go-build",
-		"GOMODCACHE=/dev/fd/3/.cache/go-mod",
-	}
-	if network {
-		env = append(env,
-			"GOPROXY=https://proxy.golang.org",
-			"GOSUMDB=sum.golang.org",
-			"GOPRIVATE=",
-			"GONOPROXY=none",
-			"GONOSUMDB=",
-		)
-	} else {
-		env = append(env, "GOPROXY=off")
-	}
-	return env
-}
-
-func runFixedCommand(ctx context.Context, root *os.File, executable string, args []string, env []string, timeout time.Duration) (fixedCommandOutcome, error) {
-	if ctx == nil || root == nil || executable == "" || timeout <= 0 {
-		return fixedCommandOutcome{}, errRequestRejected
-	}
-	path, err := resolveFixedExecutable(executable)
-	if err != nil {
-		return fixedCommandOutcome{}, errRequestRejected
-	}
-	runCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	command := exec.Command(path, args...)
-	command.ExtraFiles = []*os.File{root}
-	command.Env = env
-	command.Stdin = nil
-	command.Stdout = io.Discard
-	command.Stderr = io.Discard
-	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := command.Start(); err != nil {
-		return fixedCommandOutcome{}, errRequestRejected
-	}
-
-	wait := make(chan error, 1)
-	go func() {
-		wait <- command.Wait()
-	}()
-	select {
-	case err := <-wait:
-		if err == nil {
-			return fixedCommandOutcome{exitCode: 0}, nil
-		}
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return fixedCommandOutcome{exitCode: exitErr.ExitCode()}, nil
-		}
-		return fixedCommandOutcome{}, errRequestRejected
-	case <-runCtx.Done():
-		if command.Process != nil {
-			_ = unix.Kill(-command.Process.Pid, unix.SIGKILL)
-		}
-		<-wait
-		if ctx.Err() != nil {
-			return fixedCommandOutcome{}, errRequestRejected
-		}
-		return fixedCommandOutcome{exitCode: -1, timedOut: true}, nil
-	}
-}
-
 func newServer(repoRoot, stateRoot string) (*mcp.Server, *repo.Workspace, error) {
 	workspace, err := repo.New(repoRoot)
 	if err != nil {
@@ -235,10 +126,10 @@ func newServer(repoRoot, stateRoot string) (*mcp.Server, *repo.Workspace, error)
 		_ = workspace.Close()
 		return nil, nil, errRequestRejected
 	}
-	return newServerForComponents(workspace, tasks), workspace, nil
+	return newServerForComponents(workspace, tasks, stateRoot), workspace, nil
 }
 
-func newServerForComponents(workspace *repo.Workspace, tasks taskstate.StateStore) *mcp.Server {
+func newServerForComponents(workspace *repo.Workspace, tasks taskstate.StateStore, stateRoot string) *mcp.Server {
 	server := mcp.NewServer(
 		&mcp.Implementation{
 			Name:    "m3-repoworker",
@@ -423,7 +314,7 @@ func newServerForComponents(workspace *repo.Workspace, tasks taskstate.StateStor
 			if err := requireMain(ctx, tasks); err != nil {
 				return nil, RepoVerifyOutput{}, safeToolError(err)
 			}
-			target, timeout, ok := verificationPreset(input.Check)
+			preset, ok := verify.VerificationPreset(input.Check)
 			if !ok {
 				return nil, RepoVerifyOutput{}, errRequestRejected
 			}
@@ -432,13 +323,18 @@ func newServerForComponents(workspace *repo.Workspace, tasks taskstate.StateStor
 				return nil, RepoVerifyOutput{}, safeToolError(err)
 			}
 			defer root.Close()
-			outcome, err := runFixedCommand(ctx, root, "make", []string{"-C", "/dev/fd/3", target}, fixedExecutionEnv(false), timeout)
+			outcome, err := verify.Run(ctx, root, preset, []string{workspace.StartupPath(), stateRoot})
 			if err != nil {
 				return nil, RepoVerifyOutput{}, safeToolError(err)
 			}
 			return nil, RepoVerifyOutput{
-				Check: input.Check, Passed: outcome.exitCode == 0 && !outcome.timedOut,
-				ExitCode: outcome.exitCode, TimedOut: outcome.timedOut,
+				Check:        input.Check,
+				Passed:       outcome.ExitCode == 0 && !outcome.TimedOut,
+				ExitCode:     outcome.ExitCode,
+				TimedOut:     outcome.TimedOut,
+				FailureStage: string(outcome.FailureStage),
+				Diagnostic:   outcome.Diagnostic,
+				Truncated:    outcome.Truncated,
 			}, nil
 		},
 	)
@@ -465,16 +361,17 @@ func newServerForComponents(workspace *repo.Workspace, tasks taskstate.StateStor
 				return nil, GoModTidyOutput{}, safeToolError(err)
 			}
 			defer root.Close()
-			outcome, err := runFixedCommand(
-				ctx, root, "go", []string{"-C", "/dev/fd/3", "mod", "tidy"},
-				fixedExecutionEnv(true), 10*time.Minute,
-			)
+			outcome, err := verify.Run(ctx, root, verify.PresetGoModTidy, []string{workspace.StartupPath(), stateRoot})
 			if err != nil {
 				return nil, GoModTidyOutput{}, safeToolError(err)
 			}
 			return nil, GoModTidyOutput{
-				Completed: outcome.exitCode == 0 && !outcome.timedOut,
-				ExitCode:  outcome.exitCode, TimedOut: outcome.timedOut,
+				Completed:    outcome.ExitCode == 0 && !outcome.TimedOut,
+				ExitCode:     outcome.ExitCode,
+				TimedOut:     outcome.TimedOut,
+				FailureStage: string(outcome.FailureStage),
+				Diagnostic:   outcome.Diagnostic,
+				Truncated:    outcome.Truncated,
 			}, nil
 		},
 	)
@@ -556,6 +453,9 @@ func safeToolError(err error) error {
 }
 
 func main() {
+	if preset, ok := verify.InternalRequest(); ok {
+		os.Exit(verify.RunInternal(preset))
+	}
 	flags := flag.NewFlagSet("repoworker", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	repoRoot := flags.String("repo-root", "", "absolute repository root")

@@ -17,7 +17,7 @@ test-race:
 	GOCACHE=$(GOCACHE) go test -race ./...
 
 mcp-integration:
-	GOCACHE=$(GOCACHE) go test ./cmd/repoworker -run '^TestMCP(Repository|Task)ToolsAndSanitizedRejection$$' -count=1
+	GOCACHE=$(GOCACHE) go test ./cmd/repoworker -run '^TestMCP((Repository|Task)ToolsAndSanitizedRejection|VerificationReturnsBoundedSanitizedDiagnostic)$$' -count=1
 
 vet:
 	GOCACHE=$(GOCACHE) go vet ./...
