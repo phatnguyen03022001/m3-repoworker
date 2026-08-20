@@ -309,29 +309,10 @@ func ValidateSpec(spec ProcessSpec) error {
 	if spec.PTY && !spec.Interactive {
 		return ErrRejected
 	}
-	if len(spec.Environment) > 128 {
+	if security.ValidateEnvironment(spec.Environment) != nil {
 		return ErrRejected
 	}
-	for _, value := range spec.Environment {
-		if !validEnvironment(value) {
-			return ErrRejected
-		}
-	}
 	return nil
-}
-
-func validEnvironment(value string) bool {
-	name, _, ok := strings.Cut(value, "=")
-	if !ok || name == "" || strings.ContainsAny(value, "\x00\r\n") {
-		return false
-	}
-	upper := strings.ToUpper(name)
-	for _, marker := range []string{"TOKEN", "SECRET", "PASSWORD", "PRIVATE_KEY", "AUTH", "SSH_AUTH_SOCK"} {
-		if strings.Contains(upper, marker) {
-			return false
-		}
-	}
-	return true
 }
 
 func (p *Process) killGroup() {

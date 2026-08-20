@@ -12,6 +12,7 @@ import (
 
 	"github.com/tienphat/m3-repoworker/internal/intelligence"
 	"github.com/tienphat/m3-repoworker/internal/loop"
+	"github.com/tienphat/m3-repoworker/internal/process"
 	"github.com/tienphat/m3-repoworker/internal/publication"
 	"github.com/tienphat/m3-repoworker/internal/security"
 )
@@ -68,14 +69,54 @@ func TestControlPlaneRealM3EndToEnd(t *testing.T) {
 	if _, err := plane.RuntimeStart(ctx, record.Generation.ID); err != nil {
 		t.Fatalf("RuntimeStart() error = %v", err)
 	}
+	shellProcess, err := plane.ProcessStart(ctx, record.Generation.ID, runtimeRecord.ID, "sh", []string{"-lc", "printf shell-ok && printf ' PATH=%s\\n' \"$PATH\" && command -v go && go test ./... && printf a | tr a b > shell-output && test ! -e /Users/repoworker-host-path"}, "/workspace", 2*time.Minute)
+	if err != nil {
+		t.Fatalf("ProcessStart(shell) error = %v", err)
+	}
+	shellOutcome, err := plane.ProcessWait(ctx, shellProcess)
+	shellChunks, err := plane.ProcessRead(ctx, shellProcess, 0, 128)
+	if err != nil || shellOutcome.ExitCode != 0 {
+		t.Fatalf("shell outcome = %#v, error = %v, output = %q", shellOutcome, err, processChunksText(shellChunks))
+	}
+	if err != nil || !strings.Contains(processChunksText(shellChunks), "shell-ok") {
+		t.Fatalf("shell output = %#v, error = %v", shellChunks, err)
+	}
+	if candidateOutput, readErr := os.ReadFile(filepath.Join(record.Generation.Path, "shell-output")); readErr != nil || string(candidateOutput) != "b" {
+		t.Fatalf("shell candidate output = %q, error = %v", candidateOutput, readErr)
+	}
+	if _, err := os.Stat(filepath.Join(root, "shell-output")); !os.IsNotExist(err) {
+		t.Fatalf("shell mutation escaped into live repository: %v", err)
+	}
+	t.Log("shell success and candidate isolation passed")
+	failingShell, err := plane.ProcessStart(ctx, record.Generation.ID, runtimeRecord.ID, "sh", []string{"-lc", "printf shell-failure >&2; exit 23"}, "/workspace", time.Minute)
+	if err != nil {
+		t.Fatalf("ProcessStart(failing shell) error = %v", err)
+	}
+	failingOutcome, err := plane.ProcessWait(ctx, failingShell)
+	if err != nil || failingOutcome.ExitCode != 23 {
+		t.Fatalf("failing shell outcome = %#v, error = %v", failingOutcome, err)
+	}
+	t.Log("failing shell exit status passed")
+	timeoutShell, err := plane.ProcessStart(ctx, record.Generation.ID, runtimeRecord.ID, "sh", []string{"-lc", "sleep 30 & wait"}, "/workspace", 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("ProcessStart(timeout shell) error = %v", err)
+	}
+	timeoutOutcome, err := plane.ProcessWait(ctx, timeoutShell)
+	if err != nil || !timeoutOutcome.TimedOut {
+		t.Fatalf("timeout shell outcome = %#v, error = %v", timeoutOutcome, err)
+	}
+	t.Log("timeout shell cleanup passed")
+	t.Log("planning verification")
 	plan, err := plane.PlanVerification(ctx, record.Generation.ID, intelligence.Target{})
 	if err != nil {
 		t.Fatalf("PlanVerification() error = %v", err)
 	}
+	t.Log("verification plan ready")
 	run, err := plane.StartLoop(ctx, "task_e2e", record.Generation.ID, runtimeRecord.ID, "--- a/main.go\n+++ b/main.go\n@@ -1,3 +1,3 @@\n package main\n \n-func main() {}\n+func main() { println(\"candidate\") }\n", plan)
 	if err != nil {
 		t.Fatalf("StartLoop() error = %v", err)
 	}
+	t.Log("loop started")
 
 	var status LoopStatus
 	for ctx.Err() == nil {
@@ -83,13 +124,14 @@ func TestControlPlaneRealM3EndToEnd(t *testing.T) {
 		if err != nil {
 			t.Fatalf("LoopStatus() error = %v", err)
 		}
-		if status.State.Phase == loop.PhaseCompleted || status.State.Phase == loop.PhaseFailed || status.State.Phase == loop.PhaseHumanCheckpoint {
+		if status.State.Phase == loop.PhaseCompleted || status.State.Phase == loop.PhaseFailed || status.State.Phase == loop.PhaseHumanCheckpoint || status.Run.Status == "failed" || status.Run.Status == "stopped" {
 			break
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 	if status.State.Phase != loop.PhaseCompleted {
-		t.Fatalf("loop state = %#v, run = %#v", status.State, status.Run)
+		events, _ := plane.Events.ListEvents(ctx, run.ID, 0, 100)
+		t.Fatalf("loop state = %#v, run = %#v, events = %#v", status.State, status.Run, events)
 	}
 	currentRecord, err := plane.WorkspaceStatus(ctx, record.Generation.ID)
 	if err != nil {
@@ -149,13 +191,14 @@ func TestControlPlaneRealM3EndToEnd(t *testing.T) {
 		if err != nil {
 			t.Fatalf("LoopStatus(recovery) error = %v", err)
 		}
-		if recoveredStatus.State.Phase == loop.PhaseCompleted || recoveredStatus.State.Phase == loop.PhaseFailed || recoveredStatus.State.Phase == loop.PhaseHumanCheckpoint {
+		if recoveredStatus.State.Phase == loop.PhaseCompleted || recoveredStatus.State.Phase == loop.PhaseFailed || recoveredStatus.State.Phase == loop.PhaseHumanCheckpoint || recoveredStatus.Run.Status == "failed" || recoveredStatus.Run.Status == "stopped" {
 			break
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 	if recoveredStatus.State.Phase != loop.PhaseCompleted {
-		t.Fatalf("recovered loop state = %#v, run = %#v", recoveredStatus.State, recoveredStatus.Run)
+		events, _ := plane.Events.ListEvents(ctx, recoveryRun.ID, 0, 100)
+		t.Fatalf("recovered loop state = %#v, run = %#v, events = %#v", recoveredStatus.State, recoveredStatus.Run, events)
 	}
 	currentRuntime, err := plane.RuntimeStatus(ctx, record.Generation.ID)
 	if err != nil || currentRuntime.ID == runtimeRecord.ID || currentRuntime.LeaseGeneration <= runtimeRecord.LeaseGeneration || currentRuntime.State != "RUNNING" {
@@ -209,4 +252,12 @@ func TestControlPlaneRealM3EndToEnd(t *testing.T) {
 
 func containsRunningMachine(output string) bool {
 	return len(output) > 0 && strings.Contains(output, "running")
+}
+
+func processChunksText(chunks []process.Chunk) string {
+	var builder strings.Builder
+	for _, chunk := range chunks {
+		builder.WriteString(chunk.Data)
+	}
+	return builder.String()
 }

@@ -21,11 +21,17 @@ func TestMaterializeIsolatedGenerationWithSnapshotBinding(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(repoRoot, ".cache"), 0o700); err != nil {
 		t.Fatalf("mkdir .cache: %v", err)
 	}
+	if err := os.Mkdir(filepath.Join(repoRoot, "bin"), 0o700); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(repoRoot, "main.txt"), []byte("before\n"), 0o600); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(repoRoot, ".cache", "ignored"), []byte("cache\n"), 0o600); err != nil {
 		t.Fatalf("write cache: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "bin", "dev-tool"), []byte("#!/bin/sh\nprintf dev-tool\n"), 0o700); err != nil {
+		t.Fatalf("write dev tool: %v", err)
 	}
 	repository, err := OpenRepository(repoRoot, stateRoot)
 	if err != nil {
@@ -50,6 +56,9 @@ func TestMaterializeIsolatedGenerationWithSnapshotBinding(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(generation.Path, ".cache")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("cache copied into generation: %v", err)
+	}
+	if mode, err := os.Stat(filepath.Join(generation.Path, "bin", "dev-tool")); err != nil || mode.Mode().Perm() != 0o700 {
+		t.Fatalf("repo-local development tool missing or mode changed: %v, %v", err, mode)
 	}
 	if err := os.WriteFile(filepath.Join(repoRoot, "main.txt"), []byte("after\n"), 0o600); err != nil {
 		t.Fatalf("mutate source: %v", err)

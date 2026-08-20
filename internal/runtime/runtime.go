@@ -52,18 +52,19 @@ type RuntimeSpec struct {
 }
 
 type Runtime struct {
-	ID              string    `json:"id"`
-	Backend         string    `json:"backend"`
-	ExternalID      string    `json:"external_id"`
-	TaskID          string    `json:"task_id"`
-	GenerationID    string    `json:"generation_id"`
-	LeaseGeneration uint64    `json:"lease_generation"`
-	WorkspacePath   string    `json:"workspace_path"`
-	Image           string    `json:"image"`
-	Identity        string    `json:"identity"`
-	State           State     `json:"state"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	ID              string               `json:"id"`
+	Backend         string               `json:"backend"`
+	ExternalID      string               `json:"external_id"`
+	TaskID          string               `json:"task_id"`
+	GenerationID    string               `json:"generation_id"`
+	LeaseGeneration uint64               `json:"lease_generation"`
+	WorkspacePath   string               `json:"workspace_path"`
+	Image           string               `json:"image"`
+	Network         security.NetworkMode `json:"network"`
+	Identity        string               `json:"identity"`
+	State           State                `json:"state"`
+	CreatedAt       time.Time            `json:"created_at"`
+	UpdatedAt       time.Time            `json:"updated_at"`
 }
 
 type Adapter interface {
@@ -108,6 +109,9 @@ func (m *Manager) Create(ctx context.Context, spec RuntimeSpec, backend string) 
 	if ctx == nil || m.repository == nil || !validBackend(backend) {
 		return Runtime{}, ErrRejected
 	}
+	if spec.Network == "" {
+		spec.Network = security.NetworkNone
+	}
 	adapter, ok := m.adapters[backend]
 	if !ok {
 		return Runtime{}, ErrUnsupported
@@ -136,7 +140,7 @@ func (m *Manager) Create(ctx context.Context, spec RuntimeSpec, backend string) 
 	}
 	id := runtimeID(spec, backend)
 	now := time.Now().UTC()
-	runtime := Runtime{ID: id, Backend: backend, TaskID: spec.TaskID, GenerationID: spec.Generation.ID, LeaseGeneration: spec.Lease.FencingGeneration, WorkspacePath: spec.WorkspacePath, Image: spec.Image, Identity: id, State: StateCreating, CreatedAt: now, UpdatedAt: now}
+	runtime := Runtime{ID: id, Backend: backend, TaskID: spec.TaskID, GenerationID: spec.Generation.ID, LeaseGeneration: spec.Lease.FencingGeneration, WorkspacePath: spec.WorkspacePath, Image: spec.Image, Network: spec.Network, Identity: id, State: StateCreating, CreatedAt: now, UpdatedAt: now}
 	m.runtimes[spec.Generation.ID] = runtime
 	if err := m.persist(runtime); err != nil {
 		delete(m.runtimes, spec.Generation.ID)
@@ -307,7 +311,7 @@ func (m *Manager) validateSpec(ctx context.Context, spec RuntimeSpec) error {
 	if spec.TaskID == "" || strings.ContainsAny(spec.TaskID, "/\\\x00\r\n") || spec.Generation.ID == "" || spec.WorkspacePath == "" || !filepath.IsAbs(spec.WorkspacePath) || filepath.Clean(spec.WorkspacePath) != spec.WorkspacePath || !filepath.IsAbs(spec.LiveRepositoryPath) || filepath.Clean(spec.LiveRepositoryPath) != spec.LiveRepositoryPath || spec.Image == "" || strings.ContainsAny(spec.Image, "\x00\r\n") || spec.CPU <= 0 || spec.CPU > 256 || spec.MemoryBytes < 64<<20 || spec.MemoryBytes > 1<<40 {
 		return ErrRejected
 	}
-	if spec.Network == security.NetworkFull {
+	if !validNetwork(spec.Network) {
 		return ErrRejected
 	}
 	if sameOrWithin(spec.LiveRepositoryPath, spec.WorkspacePath) || sameOrWithin(spec.WorkspacePath, spec.LiveRepositoryPath) {
@@ -352,7 +356,15 @@ func (m *Manager) load() error {
 		decoder.DisallowUnknownFields()
 		err = decoder.Decode(&runtime)
 		_ = file.Close()
-		if err != nil || !validRuntime(runtime) {
+		if err != nil {
+			return ErrRejected
+		}
+		// Checkpoints written before the network field was introduced are
+		// explicitly interpreted as the safe network-none mode.
+		if runtime.Network == "" {
+			runtime.Network = security.NetworkNone
+		}
+		if !validRuntime(runtime) {
 			return ErrRejected
 		}
 		m.runtimes[runtime.GenerationID] = runtime
@@ -403,13 +415,17 @@ func validBackend(value string) bool {
 
 func validRuntime(runtime Runtime) bool {
 	externalIdentityValid := runtime.ExternalID != "" || runtime.State == StateCreating || runtime.State == StateStopped || runtime.State == StateFailed || runtime.State == StateQuarantined
-	return runtime.ID != "" && validBackend(runtime.Backend) && externalIdentityValid && runtime.TaskID != "" && runtime.GenerationID != "" && runtime.LeaseGeneration > 0 && filepath.IsAbs(runtime.WorkspacePath) && runtime.Image != "" && runtime.Identity == runtime.ID && runtime.State != ""
+	return runtime.ID != "" && validBackend(runtime.Backend) && validNetwork(runtime.Network) && externalIdentityValid && runtime.TaskID != "" && runtime.GenerationID != "" && runtime.LeaseGeneration > 0 && filepath.IsAbs(runtime.WorkspacePath) && runtime.Image != "" && runtime.Identity == runtime.ID && runtime.State != ""
 }
 
 func runtimeID(spec RuntimeSpec, backend string) string {
-	data := fmt.Sprintf("%s:%s:%d:%s:%s", spec.TaskID, spec.Generation.ID, spec.Lease.FencingGeneration, spec.WorkspacePath, backend)
+	data := fmt.Sprintf("%s:%s:%d:%s:%s:%s", spec.TaskID, spec.Generation.ID, spec.Lease.FencingGeneration, spec.WorkspacePath, backend, spec.Network)
 	digest := sha256.Sum256([]byte(data))
 	return "runtime_" + hex.EncodeToString(digest[:16])
+}
+
+func validNetwork(value security.NetworkMode) bool {
+	return value == security.NetworkNone
 }
 
 func sameOrWithin(parent, candidate string) bool {
@@ -451,7 +467,7 @@ func (a AppleContainerAdapter) binary() string {
 }
 
 func (a AppleContainerAdapter) Create(ctx context.Context, spec RuntimeSpec, identity string) (string, error) {
-	if spec.Network == security.NetworkFull || spec.Network == security.NetworkRegistry {
+	if spec.Network != security.NetworkNone {
 		return "", ErrUnsupported
 	}
 	args := []string{"create", "--name", identity, "--cpus", strconv.Itoa(spec.CPU), "--memory", strconv.FormatInt(spec.MemoryBytes, 10), "--network", "none"}
@@ -507,7 +523,7 @@ func (a LimaAdapter) runner() CommandRunner {
 	return execRunner{}
 }
 func (a LimaAdapter) Create(ctx context.Context, spec RuntimeSpec, identity string) (string, error) {
-	if spec.Network == security.NetworkFull || spec.Network == security.NetworkRegistry {
+	if spec.Network != security.NetworkNone {
 		return "", ErrUnsupported
 	}
 	if _, err := a.runner().Run(ctx, "limactl", "shell", "--start", a.instance(), "--", "true"); err != nil {

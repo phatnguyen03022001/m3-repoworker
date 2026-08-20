@@ -13,6 +13,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	stdRuntime "runtime"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -265,27 +267,33 @@ func (p *Plane) Close() error {
 }
 
 func defaultPolicy() security.Policy {
-	return security.Policy{Version: security.PolicyVersion, Capabilities: []security.Capability{security.CapabilityRepoRead, security.CapabilityRepoSearch, security.CapabilityWorkspaceRead, security.CapabilityWorkspaceWrite, security.CapabilityExecute, security.CapabilityProcessControl, security.CapabilityRuntimeCreate, security.CapabilityIntegrate, security.CapabilityPublish}, Mounts: []security.MountRule{{Source: security.MountTaskWorkspace, Target: "/workspace"}}, Network: security.NetworkPolicy{Mode: security.NetworkNone}, Execution: security.ExecutionPolicy{AllowedExecutables: []string{"go", "node", "npm", "pnpm", "yarn", "cargo", "rustc", "nx", "turbo", "bazel"}, MaxArgBytes: 8192, MaxArguments: 64}}
+	return security.Policy{Version: security.PolicyVersion, Capabilities: []security.Capability{security.CapabilityRepoRead, security.CapabilityRepoSearch, security.CapabilityWorkspaceRead, security.CapabilityWorkspaceWrite, security.CapabilityExecute, security.CapabilityProcessControl, security.CapabilityRuntimeCreate, security.CapabilityIntegrate, security.CapabilityPublish}, Mounts: []security.MountRule{{Source: security.MountTaskWorkspace, Target: "/workspace"}}, Network: security.NetworkPolicy{Mode: security.NetworkNone}, Execution: security.ExecutionPolicy{AllowedExecutables: []string{"sh", "bash", "zsh", "go", "node", "npm", "pnpm", "yarn", "npx", "cargo", "rustc", "python", "python3", "pip", "pip3", "uv", "poetry", "git", "make", "staticcheck", "golangci-lint", "ruff", "black", "mypy", "pytest", "eslint", "tsc", "deno", "nx", "turbo", "bazel"}, MaxArgBytes: 8192, MaxArguments: 64, MaxEnvironmentBytes: 16 << 10, MaxEnvironmentItems: 64}}
 }
 
 func (p *Plane) authorize(ctx context.Context, capability security.Capability, target security.TargetKind, path string, execution security.ExecutionSpec, confirmation string, generation workspace.Generation) error {
-	return p.authorizeWithBinding(ctx, capability, target, path, execution, confirmation, security.ConfirmationBinding{}, generation)
+	_, err := p.authorizeDecision(ctx, capability, target, path, execution, confirmation, security.ConfirmationBinding{}, generation)
+	return err
 }
 
 func (p *Plane) authorizeWithBinding(ctx context.Context, capability security.Capability, target security.TargetKind, path string, execution security.ExecutionSpec, confirmation string, confirmationBinding security.ConfirmationBinding, generation workspace.Generation) error {
+	_, err := p.authorizeDecision(ctx, capability, target, path, execution, confirmation, confirmationBinding, generation)
+	return err
+}
+
+func (p *Plane) authorizeDecision(ctx context.Context, capability security.Capability, target security.TargetKind, path string, execution security.ExecutionSpec, confirmation string, confirmationBinding security.ConfirmationBinding, generation workspace.Generation) (security.Decision, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p == nil {
-		return ErrRejected
+		return security.Decision{}, ErrRejected
 	}
 	binding := security.Binding{RepositoryID: p.RepositoryID, FilesystemID: p.FilesystemID, LiveRepository: p.Repository.LiveRoot(), TaskWorkspace: generation.Path, WorkspaceID: generation.ID}
 	request := security.Request{SessionID: p.session.ID, PrincipalID: p.PrincipalID, RepositoryID: p.RepositoryID, Nonce: p.session.Nonce, Capability: capability, Target: target, Path: path, TrustedIntegrationRef: p.trustedRef, ConfirmationToken: confirmation, ConfirmationBinding: confirmationBinding, Execution: execution}
 	decision, err := p.Security.Authorize(ctx, request, binding)
 	if err != nil || !decision.Allowed {
-		return ErrRejected
+		return security.Decision{}, ErrRejected
 	}
 	p.session.Nonce = decision.NextNonce
-	return nil
+	return decision, nil
 }
 
 // AcceptMCPRequest records the request identity supplied in the MCP SDK's
@@ -497,7 +505,7 @@ func (p *Plane) hasVerifiedCandidate(ctx context.Context, record WorkspaceRecord
 	return false
 }
 
-func (p *Plane) RuntimeCreate(ctx context.Context, generationID, image, backend string, cpu int, memoryBytes int64) (m3runtime.Runtime, error) {
+func (p *Plane) RuntimeCreate(ctx context.Context, generationID, image, backend string, cpu int, memoryBytes int64, network ...security.NetworkMode) (m3runtime.Runtime, error) {
 	record, err := p.WorkspaceStatus(ctx, generationID)
 	if err != nil {
 		return m3runtime.Runtime{}, err
@@ -514,13 +522,26 @@ func (p *Plane) RuntimeCreate(ctx context.Context, generationID, image, backend 
 	if memoryBytes == 0 {
 		memoryBytes = 512 << 20
 	}
+	requestedNetwork := security.NetworkNone
+	if len(network) > 1 {
+		return m3runtime.Runtime{}, ErrRejected
+	}
+	if len(network) == 1 {
+		requestedNetwork = network[0]
+	}
+	// The Apple adapter currently has no domain-filtering network primitive.
+	// Keep registry and full modes unavailable rather than claiming a weaker
+	// approximation is equivalent to the requested capability.
+	if requestedNetwork != security.NetworkNone {
+		return m3runtime.Runtime{}, ErrRejected
+	}
 	if err := p.authorize(ctx, security.CapabilityRuntimeCreate, security.TargetRuntime, "", security.ExecutionSpec{}, "", record.Generation); err != nil {
 		return m3runtime.Runtime{}, ErrRejected
 	}
 	if err := p.Repository.ReserveRuntime(ctx, record.Lease, p.PrincipalID); err != nil {
 		return m3runtime.Runtime{}, ErrRejected
 	}
-	created, err := p.Runtimes.Create(ctx, m3runtime.RuntimeSpec{TaskID: generationID, Generation: record.Generation, Lease: record.Lease, WorkspacePath: record.Generation.Path, LiveRepositoryPath: p.Repository.LiveRoot(), Image: image, CPU: cpu, MemoryBytes: memoryBytes, Network: security.NetworkNone}, backend)
+	created, err := p.Runtimes.Create(ctx, m3runtime.RuntimeSpec{TaskID: generationID, Generation: record.Generation, Lease: record.Lease, WorkspacePath: record.Generation.Path, LiveRepositoryPath: p.Repository.LiveRoot(), Image: image, CPU: cpu, MemoryBytes: memoryBytes, Network: requestedNetwork}, backend)
 	if err != nil {
 		_ = p.Repository.ReleaseRuntime(ctx, record.Lease, p.PrincipalID)
 		return m3runtime.Runtime{}, ErrRejected
@@ -580,22 +601,31 @@ func (p *Plane) RuntimeStatus(ctx context.Context, generationID string) (m3runti
 }
 
 func (p *Plane) ProcessStart(ctx context.Context, generationID, runtimeID, executable string, args []string, cwd string, timeout time.Duration) (string, error) {
+	return p.ProcessStartWithEnvironment(ctx, generationID, runtimeID, executable, args, cwd, timeout, nil)
+}
+
+func (p *Plane) ProcessStartWithEnvironment(ctx context.Context, generationID, runtimeID, executable string, args []string, cwd string, timeout time.Duration, suppliedEnvironment map[string]string) (string, error) {
 	record, err := p.WorkspaceStatus(ctx, generationID)
 	if err != nil {
 		return "", err
 	}
 	runtimeRecord, err := p.Runtimes.Lookup(ctx, runtimeID)
-	if err != nil || runtimeRecord.GenerationID != generationID || runtimeRecord.State != m3runtime.StateRunning {
+	if err != nil || runtimeRecord.GenerationID != generationID || runtimeRecord.State != m3runtime.StateRunning || runtimeRecord.LeaseGeneration != record.Lease.FencingGeneration {
 		return "", ErrRejected
 	}
 	if cwd == "" {
 		cwd = "/workspace"
 	}
-	execution := security.ExecutionSpec{Backend: runtimeRecord.Backend, Executable: executable, Arguments: append([]string(nil), args...), CWD: cwd}
-	if err := p.authorize(ctx, security.CapabilityExecute, security.TargetRuntime, "", execution, "", record.Generation); err != nil {
+	environment, err := suppliedEnvironmentValues(suppliedEnvironment)
+	if err != nil {
 		return "", ErrRejected
 	}
-	handle, err := p.Processes.Start(ctx, process.ProcessSpec{TaskID: generationID, WorkspaceGeneration: generationID, LeaseGeneration: record.Lease.FencingGeneration, RuntimeID: runtimeID, Execution: security.CompiledExecution{Backend: execution.Backend, Executable: execution.Executable, Arguments: execution.Arguments, CWD: execution.CWD}, Timeout: timeout})
+	execution := security.ExecutionSpec{Backend: runtimeRecord.Backend, Executable: executable, Arguments: append([]string(nil), args...), CWD: cwd, Environment: environment}
+	decision, err := p.authorizeDecision(ctx, security.CapabilityExecute, security.TargetRuntime, "", execution, "", security.ConfirmationBinding{}, record.Generation)
+	if err != nil {
+		return "", ErrRejected
+	}
+	handle, err := p.Processes.Start(ctx, process.ProcessSpec{TaskID: generationID, WorkspaceGeneration: generationID, LeaseGeneration: record.Lease.FencingGeneration, RuntimeID: runtimeID, Execution: decision.Execution, Environment: decision.Execution.Environment, Timeout: timeout})
 	if err != nil {
 		return "", ErrRejected
 	}
@@ -608,6 +638,35 @@ func (p *Plane) ProcessStart(ctx context.Context, generationID, runtimeID, execu
 	p.processes[id] = ProcessRecord{ID: id, GenerationID: generationID, RuntimeID: runtimeID, Process: handle}
 	p.mu.Unlock()
 	return id, nil
+}
+
+func suppliedEnvironmentValues(values map[string]string) ([]string, error) {
+	const maxEnvironmentBytes = 16 << 10
+	if len(values) == 0 {
+		return nil, nil
+	}
+	if len(values) > 64 {
+		return nil, ErrRejected
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]string, 0, len(keys))
+	total := 0
+	for _, key := range keys {
+		value := values[key]
+		if strings.ContainsAny(key, "=\x00\r\n") || len(key)+len(value)+1 > maxEnvironmentBytes || total+len(key)+len(value)+1 > maxEnvironmentBytes {
+			return nil, ErrRejected
+		}
+		result = append(result, key+"="+value)
+		total += len(key) + len(value) + 1
+	}
+	if security.ValidateUserEnvironment(result, 64, 16<<10) != nil {
+		return nil, ErrRejected
+	}
+	return result, nil
 }
 
 func (p *Plane) ProcessRead(ctx context.Context, processID string, after process.Cursor, limit int) ([]process.Chunk, error) {
@@ -680,6 +739,20 @@ func (p *Plane) PlanVerification(ctx context.Context, generationID string, targe
 	}
 	if err := p.authorize(ctx, security.CapabilityWorkspaceRead, security.TargetTaskWorkspace, "", security.ExecutionSpec{}, "", record.Generation); err != nil {
 		return intelligence.VerificationPlan{}, ErrRejected
+	}
+	currentSnapshot, err := candidateSnapshot(ctx, record.Generation.Path)
+	if err != nil {
+		return intelligence.VerificationPlan{}, ErrRejected
+	}
+	if currentSnapshot != record.Generation.CandidateSnapshot {
+		refreshed, refreshErr := p.Repository.RefreshGeneration(ctx, record.Generation, record.Lease)
+		if refreshErr != nil {
+			return intelligence.VerificationPlan{}, ErrStale
+		}
+		record = WorkspaceRecord{Generation: refreshed, Lease: record.Lease}
+		p.mu.Lock()
+		p.workspaces[generationID] = record
+		p.mu.Unlock()
 	}
 	info, err := intelligence.Detect(ctx, record.Generation.Path)
 	if err != nil {

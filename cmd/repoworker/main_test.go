@@ -258,6 +258,126 @@ func TestMCPMutatingRequestReplayRejectedAtRequestBoundary(t *testing.T) {
 	}
 }
 
+func TestMCPProcessRunShellReplayDoesNotDuplicateSideEffect(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "go.mod"), "module example.invalid/shellreplay\n\ngo 1.26.6\n")
+	writeFile(t, filepath.Join(root, "main.go"), "package main\n\nfunc main() {}\n")
+	for _, args := range [][]string{{"init", "-b", "main"}, {"config", "user.name", "RepoWorker Test"}, {"config", "user.email", "repoworker@example.invalid"}, {"add", "."}, {"commit", "-m", "initial"}} {
+		if output, err := exec.Command("git", append([]string{"-C", root}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+	fakeBin := t.TempDir()
+	stateFile := filepath.Join(fakeBin, "workspace")
+	fakeContainer := filepath.Join(fakeBin, "container")
+	script := fmt.Sprintf(`#!/bin/sh
+set -eu
+state=%q
+command="${1:-}"
+if [ "$#" -gt 0 ]; then shift; fi
+case "$command" in
+create)
+  workspace=""
+  for argument in "$@"; do
+    case "$argument" in
+      source=*,target=/workspace*) workspace="${argument#source=}"; workspace="${workspace%%,target=/workspace*}" ;;
+    esac
+  done
+  printf '%%s' "$workspace" > "$state"
+  ;;
+start|stop|rm)
+  ;;
+exec)
+  while [ "$#" -gt 0 ]; do
+    case "${1:-}" in
+      --workdir|--env) shift 2 ;;
+      *) break ;;
+    esac
+  done
+  runtime="${1:-}"
+  [ -n "$runtime" ]
+  shift
+  cd "$(cat "$state")"
+  exec "$@"
+  ;;
+*)
+  exit 1
+  ;;
+esac
+`, stateFile)
+	if err := os.WriteFile(fakeContainer, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	server, plane, err := newServerWithProvider(root, t.TempDir(), testPrincipalProvider(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = plane.Close() })
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(context.Background(), serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = serverSession.Close() })
+	client := mcp.NewClient(&mcp.Implementation{Name: "shell-replay-test-client", Version: "0.0.0"}, nil)
+	clientSession, err := client.Connect(context.Background(), clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = clientSession.Close() })
+	call := func(name string, sequence uint64, arguments map[string]any) *mcp.CallToolResult {
+		result, callErr := clientSession.CallTool(context.Background(), &mcp.CallToolParams{Meta: mcp.Meta{security.MCPRequestIDMetaKey: fmt.Sprintf("shell-replay-%d", sequence), security.MCPRequestSequenceMetaKey: sequence}, Name: name, Arguments: arguments})
+		if callErr != nil {
+			t.Fatalf("CallTool(%s) error = %v", name, callErr)
+		}
+		return result
+	}
+	workspaceResult := call("workspace_create", 1, map[string]any{"task_id": "shell-replay"})
+	workspaceOutput := structuredMap(t, workspaceResult)
+	generationID, _ := workspaceOutput["generation_id"].(string)
+	if generationID == "" {
+		t.Fatalf("workspace output = %#v", workspaceOutput)
+	}
+	runtimeResult := call("runtime_create", 2, map[string]any{"generation_id": generationID, "image": "fixture-image", "backend": "apple-container", "cpu": 1, "memory_bytes": int64(128 << 20)})
+	runtimeOutput := structuredMap(t, runtimeResult)
+	runtimeID, _ := runtimeOutput["id"].(string)
+	if runtimeID == "" {
+		t.Fatalf("runtime output = %#v", runtimeOutput)
+	}
+	call("runtime_start", 3, map[string]any{"generation_id": generationID})
+	arguments := map[string]any{"generation_id": generationID, "runtime_id": runtimeID, "executable": "sh", "arguments": []string{"-lc", "printf once > replay-marker"}, "cwd": "/workspace"}
+	request := &mcp.CallToolParams{Meta: mcp.Meta{security.MCPRequestIDMetaKey: "shell-mutation-once", security.MCPRequestSequenceMetaKey: uint64(4)}, Name: "process_run", Arguments: arguments}
+	first, err := clientSession.CallTool(context.Background(), request)
+	if err != nil || first.IsError {
+		t.Fatalf("first shell process = %#v, error = %v", first, err)
+	}
+	second, err := clientSession.CallTool(context.Background(), request)
+	if err == nil && (second == nil || !second.IsError) {
+		t.Fatalf("replayed shell process = %#v, error = %v; want rejection", second, err)
+	}
+	processOutput := structuredMap(t, first)
+	processID, _ := processOutput["process_id"].(string)
+	if processID == "" {
+		t.Fatalf("first process output = %#v", processOutput)
+	}
+	waitResult := call("process_wait", 5, map[string]any{"process_id": processID})
+	if waitResult.IsError {
+		t.Fatalf("first shell process wait = %#v", waitResult)
+	}
+	readResult := call("process_read", 6, map[string]any{"process_id": processID, "limit": 32})
+	if readResult.IsError {
+		t.Fatalf("first shell process read = %#v", readResult)
+	}
+	record, err := plane.WorkspaceStatus(context.Background(), generationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content, err := os.ReadFile(filepath.Join(record.Generation.Path, "replay-marker")); err != nil || string(content) != "once" {
+		t.Fatalf("shell marker = %q, error = %v", content, err)
+	}
+}
+
 func TestProductionRepoVerifyPresetsSequentially(t *testing.T) {
 	if os.Getenv("REPOWORKER_RUN_PRESET_SEQUENCE") != "1" {
 		t.Skip("set REPOWORKER_RUN_PRESET_SEQUENCE=1 for the explicit sequential repo_verify gate")

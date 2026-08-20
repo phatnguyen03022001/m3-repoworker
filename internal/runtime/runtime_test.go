@@ -239,3 +239,17 @@ func TestAppleContainerAdapterBuildsIsolatedNoNetworkCommand(t *testing.T) {
 		t.Fatalf("live repository leaked into container command: %q", command)
 	}
 }
+
+func TestNetworkModesFailClosedWithoutDomainFiltering(t *testing.T) {
+	for _, mode := range []security.NetworkMode{security.NetworkRegistry, security.NetworkFull} {
+		runner := &recordingRunner{}
+		adapter := AppleContainerAdapter{Runner: runner, Binary: "/opt/homebrew/bin/container"}
+		_, err := adapter.Create(context.Background(), RuntimeSpec{WorkspacePath: "/private/state/gen_1", LiveRepositoryPath: "/private/repo", Image: "alpine:latest", CPU: 1, MemoryBytes: 128 << 20, Network: mode}, "runtime_test")
+		if !errors.Is(err, ErrUnsupported) {
+			t.Fatalf("network mode %q error = %v, want ErrUnsupported", mode, err)
+		}
+		if len(runner.Args) != 0 {
+			t.Fatalf("network mode %q invoked container: %#v", mode, runner.Args)
+		}
+	}
+}

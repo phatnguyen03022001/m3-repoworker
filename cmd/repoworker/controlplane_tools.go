@@ -40,15 +40,17 @@ type RuntimeCreateInput struct {
 	Backend      string `json:"backend,omitempty" jsonschema:"apple-container; Lima is not the production default"`
 	CPU          int    `json:"cpu,omitempty"`
 	MemoryBytes  int64  `json:"memory_bytes,omitempty"`
+	Network      string `json:"network,omitempty" jsonschema:"none; registry/full are rejected until domain-filtered support exists"`
 }
 
 type ProcessRunInput struct {
-	GenerationID string   `json:"generation_id"`
-	RuntimeID    string   `json:"runtime_id"`
-	Executable   string   `json:"executable" jsonschema:"allow-listed executable name; never a shell command"`
-	Arguments    []string `json:"arguments,omitempty" jsonschema:"bounded argv entries"`
-	CWD          string   `json:"cwd,omitempty" jsonschema:"workspace-relative container path, default /workspace"`
-	TimeoutSecs  int      `json:"timeout_seconds,omitempty" jsonschema:"bounded timeout; zero selects the server default"`
+	GenerationID string            `json:"generation_id"`
+	RuntimeID    string            `json:"runtime_id"`
+	Executable   string            `json:"executable" jsonschema:"typed executable name; sh/bash/zsh are allowed only inside the isolated Apple container"`
+	Arguments    []string          `json:"arguments,omitempty" jsonschema:"bounded argv entries"`
+	CWD          string            `json:"cwd,omitempty" jsonschema:"workspace-relative container path, default /workspace"`
+	Environment  map[string]string `json:"environment,omitempty" jsonschema:"bounded non-secret key/value overrides; host environment is never inherited"`
+	TimeoutSecs  int               `json:"timeout_seconds,omitempty" jsonschema:"bounded timeout; zero selects the server default"`
 }
 
 type ProcessIDInput struct {
@@ -116,6 +118,7 @@ type WorkspaceOutput struct {
 type RuntimeOutput struct {
 	ID              string          `json:"id"`
 	Backend         string          `json:"backend"`
+	Network         string          `json:"network"`
 	TaskID          string          `json:"task_id"`
 	GenerationID    string          `json:"generation_id"`
 	LeaseGeneration uint64          `json:"lease_generation"`
@@ -159,7 +162,7 @@ func publicWorkspace(record controlplane.WorkspaceRecord) WorkspaceOutput {
 }
 
 func publicRuntime(record m3runtime.Runtime) RuntimeOutput {
-	return RuntimeOutput{ID: record.ID, Backend: record.Backend, TaskID: record.TaskID, GenerationID: record.GenerationID, LeaseGeneration: record.LeaseGeneration, Identity: record.Identity, State: record.State, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}
+	return RuntimeOutput{ID: record.ID, Backend: record.Backend, Network: string(record.Network), TaskID: record.TaskID, GenerationID: record.GenerationID, LeaseGeneration: record.LeaseGeneration, Identity: record.Identity, State: record.State, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}
 }
 
 func publicVerificationPlan(plan intelligence.VerificationPlan) VerificationPlanOutput {
@@ -310,7 +313,11 @@ func newControlPlaneServer(plane *controlplane.Plane) *mcp.Server {
 	})
 
 	mcp.AddTool(server, m3Tool("runtime_create", "Create isolated runtime", "Create an Apple container bound to one leased workspace generation.", false, false, false, false), func(ctx context.Context, _ *mcp.CallToolRequest, input RuntimeCreateInput) (*mcp.CallToolResult, RuntimeOutput, error) {
-		runtimeRecord, err := plane.RuntimeCreate(ctx, input.GenerationID, input.Image, input.Backend, input.CPU, input.MemoryBytes)
+		network, err := parseRuntimeNetwork(input.Network)
+		if err != nil {
+			return nil, RuntimeOutput{}, errRequestRejected
+		}
+		runtimeRecord, err := plane.RuntimeCreate(ctx, input.GenerationID, input.Image, input.Backend, input.CPU, input.MemoryBytes, network)
 		if err != nil {
 			return nil, RuntimeOutput{}, safeToolError(err)
 		}
@@ -338,11 +345,15 @@ func newControlPlaneServer(plane *controlplane.Plane) *mcp.Server {
 		return nil, publicRuntime(runtimeRecord), nil
 	})
 
-	mcp.AddTool(server, m3Tool("process_run", "Run bounded process", "Run one allow-listed executable inside the selected isolated runtime with bounded argv, cwd, timeout, and output.", false, false, true, false), func(ctx context.Context, _ *mcp.CallToolRequest, input ProcessRunInput) (*mcp.CallToolResult, map[string]string, error) {
+	mcp.AddTool(server, m3Tool("process_run", "Run bounded process", "Run one typed executable inside the selected isolated runtime with bounded argv, controlled environment, cwd, timeout, and output. Shells are confined to the Apple container.", false, false, true, false), func(ctx context.Context, _ *mcp.CallToolRequest, input ProcessRunInput) (*mcp.CallToolResult, map[string]string, error) {
 		if input.TimeoutSecs < 0 || input.TimeoutSecs > 3600 {
 			return nil, nil, errRequestRejected
 		}
-		id, err := plane.ProcessStart(ctx, input.GenerationID, input.RuntimeID, input.Executable, input.Arguments, input.CWD, time.Duration(input.TimeoutSecs)*time.Second)
+		// process_run is asynchronous: the SDK request context is commonly
+		// canceled as soon as this response is returned. The process receives
+		// its own explicit timeout and remains controllable through the typed
+		// process_cancel/signal operations.
+		id, err := plane.ProcessStartWithEnvironment(context.WithoutCancel(ctx), input.GenerationID, input.RuntimeID, input.Executable, input.Arguments, input.CWD, time.Duration(input.TimeoutSecs)*time.Second, input.Environment)
 		if err != nil {
 			return nil, nil, safeToolError(err)
 		}
@@ -514,6 +525,17 @@ func installMCPReplayGuard(server *mcp.Server, plane *controlplane.Plane) {
 			return next(ctx, method, request)
 		}
 	})
+}
+
+func parseRuntimeNetwork(value string) (security.NetworkMode, error) {
+	if value == "" {
+		return security.NetworkNone, nil
+	}
+	mode := security.NetworkMode(value)
+	if mode != security.NetworkNone && mode != security.NetworkRegistry && mode != security.NetworkFull {
+		return "", errRequestRejected
+	}
+	return mode, nil
 }
 
 func mcpReplayMetadata(meta mcp.Meta) (string, uint64, bool) {

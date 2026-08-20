@@ -9,6 +9,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/tienphat/m3-repoworker/internal/security"
 	"golang.org/x/sys/unix"
 )
 
@@ -25,8 +26,16 @@ type ContainerStarter struct {
 	Binary  string
 }
 
+const containerPath = "/workspace/node_modules/.bin:/workspace/.venv/bin:/workspace/bin:/usr/local/go/bin:/go/bin:/usr/local/cargo/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 func (s ContainerStarter) Start(ctx context.Context, spec ProcessSpec) (Running, error) {
-	if ctx == nil || s.Resolve == nil || spec.Execution.Backend != "apple-container" || spec.Environment != nil {
+	if ctx == nil || s.Resolve == nil || spec.Execution.Backend != "apple-container" {
+		return nil, ErrRejected
+	}
+	if !sameEnvironment(spec.Environment, spec.Execution.Environment) {
+		return nil, ErrRejected
+	}
+	if err := security.ValidateUserEnvironment(spec.Environment, 64, 16<<10); err != nil {
 		return nil, ErrRejected
 	}
 	if !safeWorkspaceCWD(spec.Execution.CWD) {
@@ -46,8 +55,17 @@ func (s ContainerStarter) Start(ctx context.Context, spec ProcessSpec) (Running,
 	if filepath.Base(binary) != "container" || !filepath.IsAbs(binary) {
 		return nil, ErrRejected
 	}
-	args := []string{"exec", "--workdir", spec.Execution.CWD, containerID, spec.Execution.Executable}
-	args = append(args, spec.Execution.Arguments...)
+	args := []string{"exec", "--workdir", spec.Execution.CWD}
+	for _, value := range containerBaselineEnvironment() {
+		args = append(args, "--env", value)
+	}
+	for _, value := range spec.Environment {
+		// Only explicit key=value pairs are passed. In particular, never pass a
+		// bare key because Apple container would inherit it from the host CLI.
+		args = append(args, "--env", value)
+	}
+	args = append(args, containerID, spec.Execution.Executable)
+	args = append(args, containerShellArguments(spec.Execution.Executable, spec.Execution.Arguments)...)
 	command := exec.CommandContext(ctx, binary, args...)
 	command.Env = []string{"PATH=/usr/bin:/bin:/opt/homebrew/bin", "LC_ALL=C"}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -71,6 +89,46 @@ func (s ContainerStarter) Start(ctx context.Context, spec ProcessSpec) (Running,
 	}
 	running.stdout, running.stderr = stdout, stderr
 	return running, nil
+}
+
+func containerBaselineEnvironment() []string {
+	return []string{
+		"PATH=" + containerPath,
+		"HOME=/tmp",
+		"TMPDIR=/tmp",
+		"LC_ALL=C",
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=/dev/null",
+	}
+}
+
+// Login shells may reset PATH from /etc/profile after the container runtime
+// has applied --env. Re-establish the deterministic candidate-only PATH inside
+// the shell session without inspecting or restricting the caller's command.
+func containerShellArguments(executable string, arguments []string) []string {
+	result := append([]string(nil), arguments...)
+	if len(result) >= 2 && result[0] == "-lc" && isDevelopmentShell(executable) {
+		result[1] = "PATH='" + containerPath + "'; export PATH; " + result[1]
+	}
+	return result
+}
+
+func isDevelopmentShell(executable string) bool {
+	base := strings.ToLower(filepath.Base(executable))
+	return base == "sh" || base == "bash" || base == "zsh"
+}
+
+func sameEnvironment(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 type containerRunning struct {

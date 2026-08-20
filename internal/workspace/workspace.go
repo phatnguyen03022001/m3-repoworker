@@ -460,7 +460,7 @@ func (r *Repository) DiscardGeneration(ctx context.Context, generationID string)
 // was performed inside the generation. It never touches the live repository;
 // the active lease remains the mutation fence for the metadata update.
 func (r *Repository) RefreshGeneration(ctx context.Context, generation Generation, lease Lease) (Generation, error) {
-	if err := r.AssertGeneration(ctx, generation, lease); err != nil {
+	if err := r.AssertLease(ctx, lease); err != nil {
 		return Generation{}, err
 	}
 	r.mu.Lock()
@@ -469,7 +469,7 @@ func (r *Repository) RefreshGeneration(ctx context.Context, generation Generatio
 		return Generation{}, ErrRejected
 	}
 	loaded, err := r.loadGeneration(generation.ID)
-	if err != nil || loaded.Path != generation.Path {
+	if err != nil || loaded.Path != generation.Path || loaded.RepositoryID != r.rootIdentity || loaded.SourceFilesystem != r.filesystemID || lease.GenerationID != generation.ID {
 		return Generation{}, ErrStaleFence
 	}
 	snapshot, err := snapshotTree(ctx, loaded.Path)
@@ -671,7 +671,7 @@ func copyTree(ctx context.Context, source, destination string) error {
 		if err != nil {
 			return err
 		}
-		if excluded(relative) {
+		if candidateExcluded(relative) {
 			if entry.IsDir() {
 				return fs.SkipDir
 			}
@@ -731,6 +731,16 @@ func copyRegular(source, destination string, mode fs.FileMode) error {
 func excluded(relative string) bool {
 	first := strings.Split(filepath.ToSlash(relative), "/")[0]
 	return first == ".git" || first == ".cache" || first == "bin" || first == ".repoworker-state" ||
+		(first == ".generation.json" || first == ".lease.json" || first == ".runtime-owner.json")
+}
+
+// candidateExcluded is intentionally narrower than excluded. A development
+// command may need repository-local tools from bin/, while generated tools in
+// that directory must never become part of a live-repository snapshot or
+// integration plan.
+func candidateExcluded(relative string) bool {
+	first := strings.Split(filepath.ToSlash(relative), "/")[0]
+	return first == ".git" || first == ".cache" || first == ".repoworker-state" ||
 		(first == ".generation.json" || first == ".lease.json" || first == ".runtime-owner.json")
 }
 

@@ -301,13 +301,30 @@ func TestCompilationRejectsLiveWorkspaceOverlapFullNetworkAndHostShell(t *testin
 	if _, err := Compile(full, binding); !errors.Is(err, ErrDenied) {
 		t.Fatalf("full network Compile() error = %v", err)
 	}
-	for _, executable := range []string{"/bin/sh", "/bin/bash"} {
-		if _, err := CompileExecution(ExecutionPolicy{AllowedExecutables: []string{executable}}, ExecutionSpec{Backend: "apple-container", Executable: executable, CWD: "/workspace"}); !errors.Is(err, ErrDenied) {
-			t.Fatalf("shell executable %q accepted: %v", executable, err)
+	for _, executable := range []string{"sh", "bash", "zsh"} {
+		if _, err := CompileExecution(ExecutionPolicy{AllowedExecutables: []string{executable}}, ExecutionSpec{Backend: "apple-container", Executable: executable, CWD: "/workspace", Arguments: []string{"-lc", "printf shell-ok"}}); err != nil {
+			t.Fatalf("container shell executable %q rejected: %v", executable, err)
 		}
+	}
+	if _, err := CompileExecution(ExecutionPolicy{AllowedExecutables: []string{"sh"}}, ExecutionSpec{Backend: "lima", Executable: "sh", CWD: "/workspace"}); !errors.Is(err, ErrDenied) {
+		t.Fatalf("Lima shell accepted: %v", err)
+	}
+	if _, err := CompileExecution(ExecutionPolicy{AllowedExecutables: []string{"sh"}}, ExecutionSpec{Backend: "apple-container", Executable: "/bin/sh", CWD: "/workspace"}); !errors.Is(err, ErrDenied) {
+		t.Fatalf("unscoped host path shell accepted: %v", err)
 	}
 	if _, err := CompileExecution(testPolicy().Execution, ExecutionSpec{Backend: "host", Executable: "/usr/bin/go", CWD: "/workspace"}); !errors.Is(err, ErrDenied) {
 		t.Fatalf("host backend accepted: %v", err)
+	}
+}
+
+func TestUserEnvironmentIsBoundedAndSecretFree(t *testing.T) {
+	if err := ValidateUserEnvironment([]string{"FOO=bar", "GOPROXY=https://proxy.golang.org"}, 8, 1024); err != nil {
+		t.Fatalf("safe environment rejected: %v", err)
+	}
+	for _, value := range []string{"PATH=/tmp", "Authorization=Bearer hidden", "GITHUB_TOKEN=secret", "PRIVATE_KEY=hidden", "INHERIT_ONLY"} {
+		if err := ValidateUserEnvironment([]string{value}, 8, 1024); !errors.Is(err, ErrDenied) {
+			t.Fatalf("sensitive environment %q accepted: %v", value, err)
+		}
 	}
 }
 

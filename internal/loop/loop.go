@@ -124,15 +124,15 @@ func New(store *events.Store, model Model, authority Authority, maxRetries int) 
 
 func (c *Controller) Run(ctx context.Context, request Request) (State, error) {
 	if ctx == nil || !validRequest(request) {
-		return State{}, ErrRejected
+		return State{}, fmt.Errorf("loop request validation: %w", ErrRejected)
 	}
 	run, err := c.store.GetRun(ctx, request.RunID)
 	if err != nil || run.RepositoryID != request.Binding.RepositoryID || run.CandidateSnapshot != request.Binding.CandidateSnapshot || run.EnvironmentID != request.Binding.EnvironmentID || run.PolicyVersion != request.Binding.PolicyVersion {
-		return State{}, ErrRejected
+		return State{}, fmt.Errorf("loop run binding: %w", ErrRejected)
 	}
 	state, err := c.load(ctx, request)
 	if err != nil {
-		return State{}, err
+		return State{}, fmt.Errorf("loop state load: %w", err)
 	}
 	for {
 		if err := ctx.Err(); err != nil {
@@ -262,7 +262,7 @@ func (c *Controller) Run(ctx context.Context, request Request) (State, error) {
 			return State{}, ErrRejected
 		}
 		if err := c.persist(ctx, request.RunID, state); err != nil {
-			return State{}, err
+			return State{}, fmt.Errorf("loop state persistence: %w", err)
 		}
 	}
 }

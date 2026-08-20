@@ -88,9 +88,11 @@ type CredentialPolicy struct {
 }
 
 type ExecutionPolicy struct {
-	AllowedExecutables []string
-	MaxArgBytes        int
-	MaxArguments       int
+	AllowedExecutables  []string
+	MaxArgBytes         int
+	MaxArguments        int
+	MaxEnvironmentBytes int
+	MaxEnvironmentItems int
 }
 
 type Policy struct {
@@ -238,10 +240,11 @@ type Binding struct {
 }
 
 type ExecutionSpec struct {
-	Backend    string
-	Executable string
-	Arguments  []string
-	CWD        string
+	Backend     string
+	Executable  string
+	Arguments   []string
+	CWD         string
+	Environment []string
 }
 
 type CompiledMount struct {
@@ -263,10 +266,11 @@ type CompiledPolicy struct {
 }
 
 type CompiledExecution struct {
-	Backend    string
-	Executable string
-	Arguments  []string
-	CWD        string
+	Backend     string
+	Executable  string
+	Arguments   []string
+	CWD         string
+	Environment []string
 }
 
 type Decision struct {
@@ -509,7 +513,13 @@ func CompileExecution(policy ExecutionPolicy, spec ExecutionSpec) (CompiledExecu
 	if spec.Backend != "apple-container" && spec.Backend != "lima" {
 		return CompiledExecution{}, ErrDenied
 	}
-	if !safeRuntimePath(spec.CWD) || spec.Executable == "" || strings.ContainsAny(spec.Executable, "\x00\r\n") || isShell(spec.Executable) || !containsString(policy.AllowedExecutables, spec.Executable) {
+	if !safeRuntimePath(spec.CWD) || spec.Executable == "" || strings.ContainsAny(spec.Executable, "\x00\r\n") || !containsString(policy.AllowedExecutables, spec.Executable) {
+		return CompiledExecution{}, ErrDenied
+	}
+	// A shell is a strong capability. It is permitted only after the
+	// execution has crossed the Apple container boundary; neither the test
+	// backend nor Lima may turn this API into a host shell.
+	if isShell(spec.Executable) && spec.Backend != "apple-container" {
 		return CompiledExecution{}, ErrDenied
 	}
 	maxArgs := policy.MaxArguments
@@ -534,7 +544,91 @@ func CompileExecution(policy ExecutionPolicy, spec ExecutionSpec) (CompiledExecu
 	if bytes > maxBytes {
 		return CompiledExecution{}, ErrDenied
 	}
-	return CompiledExecution{Backend: spec.Backend, Executable: spec.Executable, Arguments: args, CWD: spec.CWD}, nil
+	maxEnvironmentItems := policy.MaxEnvironmentItems
+	if maxEnvironmentItems <= 0 {
+		maxEnvironmentItems = 64
+	}
+	maxEnvironmentBytes := policy.MaxEnvironmentBytes
+	if maxEnvironmentBytes <= 0 {
+		maxEnvironmentBytes = 16 << 10
+	}
+	if err := ValidateUserEnvironment(spec.Environment, maxEnvironmentItems, maxEnvironmentBytes); err != nil {
+		return CompiledExecution{}, ErrDenied
+	}
+	return CompiledExecution{Backend: spec.Backend, Executable: spec.Executable, Arguments: args, CWD: spec.CWD, Environment: append([]string(nil), spec.Environment...)}, nil
+}
+
+// ValidateEnvironment validates an already materialized environment. It is
+// intentionally separate from ValidateUserEnvironment because the local
+// process supervisor tests may supply a complete baseline, while MCP callers
+// may only supply bounded non-secret overrides.
+func ValidateEnvironment(values []string) error {
+	return validateEnvironment(values, 128, 32<<10, false)
+}
+
+// ValidateUserEnvironment validates values supplied through MCP. Bare names
+// are never accepted because the container runtime would interpret them as
+// host-environment inheritance. Deterministic baseline variables are owned by
+// the container adapter and cannot be overridden by a caller.
+func ValidateUserEnvironment(values []string, maxItems, maxBytes int) error {
+	return validateEnvironment(values, maxItems, maxBytes, true)
+}
+
+func validateEnvironment(values []string, maxItems, maxBytes int, userSupplied bool) error {
+	if len(values) > maxItems || maxItems <= 0 || maxBytes <= 0 {
+		return ErrDenied
+	}
+	total := 0
+	for _, value := range values {
+		name, _, ok := strings.Cut(value, "=")
+		if !ok || !validEnvironmentName(name) || strings.ContainsAny(value, "\x00\r\n") || !utf8.ValidString(value) {
+			return ErrDenied
+		}
+		if userSupplied && protectedEnvironmentName(name) {
+			return ErrDenied
+		}
+		if containsSensitiveEnvironmentMarker(name) {
+			return ErrDenied
+		}
+		total += len(value)
+		if total > maxBytes {
+			return ErrDenied
+		}
+	}
+	return nil
+}
+
+func validEnvironmentName(name string) bool {
+	if name == "" || (name[0] != '_' && (name[0] < 'A' || name[0] > 'Z') && (name[0] < 'a' || name[0] > 'z')) {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		value := name[i]
+		if value != '_' && (value < 'A' || value > 'Z') && (value < 'a' || value > 'z') && (value < '0' || value > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func protectedEnvironmentName(name string) bool {
+	upper := strings.ToUpper(name)
+	for _, protected := range []string{"PATH", "HOME", "TMPDIR", "LC_ALL", "PWD", "OLDPWD", "SHELL", "ENV", "BASH_ENV", "ZDOTDIR", "LD_PRELOAD", "LD_LIBRARY_PATH", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL"} {
+		if upper == protected {
+			return true
+		}
+	}
+	return false
+}
+
+func containsSensitiveEnvironmentMarker(name string) bool {
+	upper := strings.ToUpper(name)
+	for _, marker := range []string{"AUTHORIZATION", "BEARER", "TOKEN", "SECRET", "PASSWORD", "PRIVATE_KEY", "SSH_AUTH_SOCK", "CONTROL_PLANE_API_KEY", "OPERATOR_KEY", "GITHUB_TOKEN", "AWS_SECRET", "AWS_ACCESS_KEY", "AZURE_CLIENT_SECRET", "GOOGLE_APPLICATION_CREDENTIALS"} {
+		if strings.Contains(upper, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func validatePolicy(policy Policy) error {

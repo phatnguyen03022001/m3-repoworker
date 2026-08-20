@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -164,4 +165,51 @@ func TestProcessRejectsInvalidCWDAndEnvironment(t *testing.T) {
 	if !strings.Contains(string(StreamStdout), "stdout") {
 		t.Fatal("stream constants malformed")
 	}
+}
+
+func TestContainerStarterBuildsBoundedContainerShellWithExplicitEnvironment(t *testing.T) {
+	binDir := t.TempDir()
+	fakeContainer := filepath.Join(binDir, "container")
+	if err := os.Symlink("/bin/echo", fakeContainer); err != nil {
+		t.Fatal(err)
+	}
+	starter := ContainerStarter{Binary: fakeContainer, Resolve: func(context.Context, string) (string, error) { return "opaque-runtime", nil }}
+	supervisor, err := New(starter, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := supervisor.Start(context.Background(), ProcessSpec{
+		TaskID: "task-shell", WorkspaceGeneration: "gen-shell", LeaseGeneration: 1, RuntimeID: "runtime-shell",
+		Execution:   security.CompiledExecution{Backend: "apple-container", Executable: "sh", Arguments: []string{"-lc", "printf shell-ok"}, CWD: "/workspace", Environment: []string{"DEV_MODE=1"}},
+		Environment: []string{"DEV_MODE=1"}, Timeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	outcome, err := run.Wait(context.Background())
+	if err != nil || outcome.ExitCode != 0 {
+		t.Fatalf("Wait() = %#v, %v", outcome, err)
+	}
+	chunks, err := run.Read(0, 16)
+	output := processChunksText(chunks)
+	if err != nil || !strings.Contains(output, "exec") {
+		t.Fatalf("output = %#v, error = %v", chunks, err)
+	}
+	arguments := output
+	for _, expected := range []string{"exec", "--workdir", "/workspace", "--env", "PATH=/workspace/node_modules/.bin", "--env", "DEV_MODE=1", "opaque-runtime", "sh", "-lc", "printf shell-ok"} {
+		if !strings.Contains(arguments, expected) {
+			t.Fatalf("container argv %q missing %q", arguments, expected)
+		}
+	}
+	if strings.Contains(arguments, "/Users/") || strings.Contains(arguments, "Authorization") {
+		t.Fatalf("host or credential material leaked into container argv: %q", arguments)
+	}
+}
+
+func processChunksText(chunks []Chunk) string {
+	var builder strings.Builder
+	for _, chunk := range chunks {
+		builder.WriteString(chunk.Data)
+	}
+	return builder.String()
 }

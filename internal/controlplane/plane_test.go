@@ -130,7 +130,12 @@ create)
 start|stop|rm)
   ;;
 exec)
-  if [ "${1:-}" = "--workdir" ]; then shift 2; fi
+  while [ "$#" -gt 0 ]; do
+    case "${1:-}" in
+      --workdir|--env) shift 2 ;;
+      *) break ;;
+    esac
+  done
   runtime="${1:-}"
   if [ -z "$runtime" ]; then exit 1; fi
   shift

@@ -383,10 +383,23 @@ func (p *Plane) launchLoop(ctx context.Context, run events.Run, config loopConfi
 			_, err := controller.Run(loopContext, loop.Request{RunID: run.ID, Binding: binding})
 			return err
 		}(); loopErr != nil && !errors.Is(loopErr, context.Canceled) && loopContext.Err() == nil {
-			_, _ = p.Events.AppendEvent(context.Background(), run.ID, "loop.error", "autonomous loop stopped")
+			payload, _ := json.Marshal(boundedLoopError(loopErr))
+			_, _ = p.Events.AppendEvent(context.Background(), run.ID, "loop.error", string(payload))
 			_ = p.Events.UpdateRunStatus(context.Background(), run.ID, "failed")
 		}
 	}()
+}
+
+func boundedLoopError(err error) string {
+	const prefix = "autonomous loop stopped: "
+	if err == nil {
+		return "autonomous loop stopped"
+	}
+	detail := strings.TrimSpace(err.Error())
+	if detail == "" || len(detail) > 256 || strings.ContainsAny(detail, "\x00\r\n") || containsSecret(detail) {
+		return "autonomous loop stopped"
+	}
+	return prefix + detail
 }
 
 type loopModel struct {
