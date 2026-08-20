@@ -193,7 +193,7 @@ func rootDevice(file *os.File) (uint64, error) {
 
 func (w *Workspace) openExistingRelative(input string, allowRoot bool) (*os.File, string, error) {
 	cleanPath, err := cleanRelativePath(input)
-	if err != nil || (!allowRoot && cleanPath == ".") || isProtected(cleanPath) {
+	if err != nil || (!allowRoot && cleanPath == ".") || isUnavailable(cleanPath) {
 		return nil, "", ErrRejected
 	}
 	rootDev, err := rootDevice(w.rootDir)
@@ -317,7 +317,7 @@ func (w *Workspace) searchDirectory(ctx context.Context, query string, dir *os.F
 		if relativeDir != "." {
 			relativePath = relativeDir + "/" + entry.Name()
 		}
-		if isProtected(relativePath) || entry.Type()&fs.ModeSymlink != 0 {
+		if isUnavailable(relativePath) || entry.Type()&fs.ModeSymlink != 0 {
 			continue
 		}
 		child, _, err := w.openExistingRelative(relativePath, true)
@@ -438,7 +438,7 @@ func (w *Workspace) snapshotDirectory(ctx context.Context, dir *os.File, relativ
 		if relativeDir != "." {
 			relativePath = relativeDir + "/" + entry.Name()
 		}
-		if isProtected(relativePath) {
+		if isUnavailable(relativePath) {
 			continue
 		}
 		if entry.Type()&fs.ModeSymlink != 0 {
@@ -565,7 +565,7 @@ func fdStat(file *os.File) (unix.Stat_t, error) {
 
 func (w *Workspace) openParentDirectory(input string) (*os.File, string, error) {
 	cleanPath, err := cleanRelativePath(input)
-	if err != nil || cleanPath == "." || isProtected(cleanPath) {
+	if err != nil || cleanPath == "." || isUnavailable(cleanPath) {
 		return nil, "", ErrRejected
 	}
 	slashPath := filepath.ToSlash(cleanPath)
@@ -697,7 +697,7 @@ func (w *Workspace) CreateFile(path, content string) (string, error) {
 		return "", ErrRejected
 	}
 	cleanPath, err := cleanRelativePath(path)
-	if err != nil || cleanPath == "." || isProtected(cleanPath) {
+	if err != nil || cleanPath == "." || isUnavailable(cleanPath) {
 		return "", ErrRejected
 	}
 	parent, baseName, err := w.openParentDirectory(cleanPath)
@@ -750,7 +750,7 @@ func (w *Workspace) DeleteFile(path string) (string, error) {
 	defer w.mu.Unlock()
 
 	cleanPath, err := cleanRelativePath(path)
-	if err != nil || cleanPath == "." || isProtected(cleanPath) {
+	if err != nil || cleanPath == "." || isUnavailable(cleanPath) {
 		return "", ErrRejected
 	}
 	parent, baseName, err := w.openParentDirectory(cleanPath)
@@ -815,6 +815,15 @@ func containsGitDirectory(path string) bool {
 		}
 	}
 	return false
+}
+
+// isUnavailable combines the secret-bearing path policy with the repository's
+// exact root-relative generated-output policy. It deliberately does not parse
+// .gitignore or blacklist matching directory names at arbitrary depths.
+func isUnavailable(relativePath string) bool {
+	slashPath := filepath.ToSlash(relativePath)
+	generated := slashPath == ".cache" || strings.HasPrefix(slashPath, ".cache/") || slashPath == "bin/repoworker"
+	return generated || isProtected(relativePath)
 }
 
 func isProtected(relativePath string) bool {
@@ -1006,7 +1015,7 @@ func patchPath(headerPath, expectedPrefix string) (string, error) {
 		return "", ErrRejected
 	}
 	path, err := cleanRelativePath(strings.TrimPrefix(headerPath, expectedPrefix))
-	if err != nil || path == "." || isProtected(path) {
+	if err != nil || path == "." || isUnavailable(path) {
 		return "", ErrRejected
 	}
 	return filepath.ToSlash(path), nil

@@ -302,8 +302,8 @@ func TestSearchBoundsLongMatchText(t *testing.T) {
 	}
 }
 
-func TestSnapshotManifestIsDeterministicAndOmitsProtectedPaths(t *testing.T) {
-	root, _ := testWorkspace(t)
+func TestSnapshotManifestIsDeterministicAndOmitsUnavailablePaths(t *testing.T) {
+	root, outside := testWorkspace(t)
 	workspace, err := New(root)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -311,6 +311,37 @@ func TestSnapshotManifestIsDeterministicAndOmitsProtectedPaths(t *testing.T) {
 	defer workspace.Close()
 	writeTestFile(t, filepath.Join(root, "src", "main.go"), "package main\n")
 	writeTestFile(t, filepath.Join(root, ".env"), "hidden\n")
+	writeTestFile(t, filepath.Join(root, ".cache", "go-build", "cache.txt"), "generated-marker\n")
+	writeTestFile(t, filepath.Join(root, "bin", "repoworker"), "generated-marker\n")
+	writeTestFile(t, filepath.Join(root, ".github", "workflows", "test.yml"), "visible-marker\n")
+	writeTestFile(t, filepath.Join(root, "tools", "bin", "repoworker"), "visible-marker\n")
+	writeTestFile(t, filepath.Join(outside, "outside.txt"), "outside\n")
+	if err := os.Symlink(filepath.Join(outside, "outside.txt"), filepath.Join(root, ".cache", "escape")); err != nil {
+		t.Fatalf("Symlink(excluded cache) error = %v", err)
+	}
+
+	for _, path := range []string{".cache/go-build/cache.txt", "bin/repoworker"} {
+		if _, _, err := workspace.Read(path); !errors.Is(err, ErrRejected) {
+			t.Fatalf("Read(%q) error = %v, want ErrRejected", path, err)
+		}
+	}
+	if _, content, err := workspace.Read("tools/bin/repoworker"); err != nil || content != "visible-marker\n" {
+		t.Fatalf("Read(nested bin) = %q, %v, want visible source", content, err)
+	}
+	hidden, err := workspace.Search(context.Background(), "generated-marker", "")
+	if err != nil {
+		t.Fatalf("Search(generated) error = %v", err)
+	}
+	if len(hidden.Matches) != 0 || hidden.Truncated {
+		t.Fatalf("Search(generated) = %#v, want no matches without truncation", hidden)
+	}
+	visible, err := workspace.Search(context.Background(), "visible-marker", "")
+	if err != nil {
+		t.Fatalf("Search(visible) error = %v", err)
+	}
+	if len(visible.Matches) != 2 || visible.Truncated {
+		t.Fatalf("Search(visible) = %#v, want two valid source matches", visible)
+	}
 
 	first, err := workspace.Snapshot(context.Background())
 	if err != nil {
@@ -329,6 +360,16 @@ func TestSnapshotManifestIsDeterministicAndOmitsProtectedPaths(t *testing.T) {
 	}
 	if _, ok := entries[".env"]; ok {
 		t.Fatal("protected .env unexpectedly present in snapshot")
+	}
+	for path := range entries {
+		if path == ".cache" || strings.HasPrefix(path, ".cache/") || path == "bin/repoworker" {
+			t.Fatalf("generated path %q unexpectedly present in snapshot", path)
+		}
+	}
+	for _, path := range []string{".github", ".github/workflows/test.yml", "tools/bin/repoworker"} {
+		if _, ok := entries[path]; !ok {
+			t.Fatalf("valid path %q missing from snapshot", path)
+		}
 	}
 	if entry, ok := entries["src"]; !ok || entry.Type != "directory" {
 		t.Fatalf("src entry = %#v, want directory", entry)
@@ -360,6 +401,21 @@ func TestSnapshotRejectsSymlink(t *testing.T) {
 	}
 	if _, err := workspace.Snapshot(context.Background()); !errors.Is(err, ErrRejected) {
 		t.Fatalf("Snapshot(symlink) error = %v, want ErrRejected", err)
+	}
+}
+
+func TestSnapshotRejectsSpecialFileOutsideExclusions(t *testing.T) {
+	root, _ := testWorkspace(t)
+	workspace, err := New(root)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer workspace.Close()
+	if err := unix.Mkfifo(filepath.Join(root, "pipe"), 0o600); err != nil {
+		t.Fatalf("Mkfifo() error = %v", err)
+	}
+	if _, err := workspace.Snapshot(context.Background()); !errors.Is(err, ErrRejected) {
+		t.Fatalf("Snapshot(FIFO) error = %v, want ErrRejected", err)
 	}
 }
 
