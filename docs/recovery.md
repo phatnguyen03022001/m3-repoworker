@@ -20,3 +20,10 @@ path containment, size, and digest before exposing bytes. Retention removes
 only terminal runs and their private artifacts. FSEvents-style notifications
 are advisory invalidation hints; snapshot authority remains digest verification
 against the live repository and workspace generation.
+
+The autonomous loop replays its `loop.state` events from sequence zero in
+bounded pages and resumes at the last persisted phase. Model proposals are
+revalidated against the run binding before the local authority executes them.
+Failed action fingerprints are persisted, so a retry cannot repeat the same
+failed action; the retry budget is bounded and exhausted loops fail closed.
+Destructive or ambiguous plans stop at a human checkpoint.

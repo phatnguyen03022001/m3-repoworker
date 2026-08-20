@@ -31,6 +31,9 @@ The current M3.1 substrate consists of:
 - `internal/events`: durable SQLite runs, ordered append-only events,
   cursor-resumable logs, digest-verified artifacts, immutable checkpoints,
   retention GC, and invalidation hints.
+- `internal/loop`: fixed typed autonomous coding loop with persisted phase
+  transitions, bounded retries, failure taxonomy, binding checks, and human
+  checkpoints for ambiguous or destructive plans.
 
 M3.2–M3.10 will bind authenticated principals, capabilities, process/runtime
 backends, resource admission, verification, events, autonomous-loop state,
