@@ -28,6 +28,9 @@ The current M3.1 substrate consists of:
   non-authoritative cache.
 - `internal/intelligence`: native ecosystem detection, typed targeted/full
   verification plans, and candidate/environment/policy-bound results.
+- `internal/events`: durable SQLite runs, ordered append-only events,
+  cursor-resumable logs, digest-verified artifacts, immutable checkpoints,
+  retention GC, and invalidation hints.
 
 M3.2–M3.10 will bind authenticated principals, capabilities, process/runtime
 backends, resource admission, verification, events, autonomous-loop state,

@@ -126,3 +126,19 @@
   logs, retention/GC, FSEvents invalidation hints, and crash/restart replay.
 - Exact next action: design the durable event schema and append-only replay
   contract, then add retention and restart tests.
+
+## M3.8 — IN PROGRESS
+
+- State: durable run/event/artifact/checkpoint substrate implemented; awaiting
+  verification and local checkpoint on `main`.
+- Scope: private SQLite runs, ordered append-only events, cursor-resumable log
+  reads, digest-verified private artifacts, immutable checkpoints, terminal-run
+  retention GC, and advisory FSEvents-style invalidation hints.
+- Tests: focused tests cover restart replay, missing-run rejection, cursor
+  ordering, artifact corruption, retention cleanup, payload rejection, and
+  invalidation-hint consumption.
+- Decisions: see `docs/adr/0008-m3.8-durable-events.md`.
+- Remaining: run the full repository verification gate, then implement M3.9
+  autonomous-loop state and bounded continuation/recovery.
+- Exact next action: run `make verify` and `govulncheck`, checkpoint M3.8, and
+  begin the durable autonomous-loop controller.
