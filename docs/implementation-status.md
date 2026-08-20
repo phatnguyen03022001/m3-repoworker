@@ -38,16 +38,19 @@
 - Exact next action: define `ProcessSpec` and the supervised process contract,
   bind it to the M3.2 runtime policy, and add leak/race/timeout tests.
 
-## M3.3 — IN PROGRESS
+## M3.3 — GREEN
 
-- State: typed supervised process layer implemented locally; verification and
-  checkpoint pending.
+- State: typed supervised process layer implemented and checkpointed on local
+  `main`.
+- Commit: `0ef2f57` (`m3.3: supervised process layer`).
 - Scope: `ProcessSpec`, starter abstraction, monotonic stdout/stderr/PTY
   cursors, bounded memory with durable spill, cancellation/timeout and
   process-group cleanup, signals, environment rejection, and optional PTY.
 - Tests: process unit tests cover cursor resume, spill permissions, timeout,
   cancellation, signal cleanup, PTY gating, and credential environment denial.
 - Decisions: see `docs/adr/0003-m3.3-supervised-processes.md`.
-- Remaining: run full verification and checkpoint on `main`.
-- Exact next action: run `make verify`, `govulncheck ./...`, inspect the diff,
-  and commit `m3.3: supervised process layer`.
+- Remaining: M3.4 runtime backend abstraction with Apple container primary,
+  Lima fallback/test adapter, lifecycle state, isolated workspace mounts,
+  network/resource defaults, identity binding, and crash cleanup.
+- Exact next action: define the `RuntimeBackend` contract and lifecycle state
+  machine, then add Apple container/Lima adapters with mount and network tests.
