@@ -1,185 +1,54 @@
 # Implementation status
 
-## M3.1 — GREEN
+## M3.1–M3.10 — implemented on local main
 
-- State: implementation complete and checkpointed on local `main`.
-- Commit: `d54a787` (`m3.1: transactional workspace and state`).
-- Scope: SQLite task state with strict JSON migration, private WAL/SHM,
-  integrity checks, isolated workspace generations, APFS clone/copy fallback,
-  lease/runtime fencing, digest-bound FD-relative integration journals and
-  immutable FTS5 memory.
-- Tests: `make ci`, `make verify`, and
-  `GOCACHE=.cache/go-build govulncheck ./...` are green; package unit/race
-  tests cover `internal/taskstate`, `internal/workspace`, and
-  `internal/memory`.
-- Decisions: see `docs/adr/0001-m3.1-transactional-workspace.md`.
-- Remaining: M3.2 typed deny-by-default execution security policy,
-  principal/session binding, enrollment, credential/network policy, audit, and
-  confirmation classes.
-- Exact next action: inspect the current security boundary and implement the
-  M3.2 policy compiler and its adversarial tests on local `main`.
+The production path is wired through internal/controlplane and the production
+MCP adapter. It includes:
 
-## M3.2 — GREEN
+- transactional task state, isolated TaskWorkspace generations, leases,
+  descriptor-relative integration, memory, and crash recovery;
+- deny-by-default security with local principal/session binding, nonce replay
+  protection, confirmations, mount/network/executable policy, and audit;
+- bounded supervised processes, Apple container lifecycle, Lima validation,
+  scheduler/resource admission, environment identities and private caches;
+- native repository intelligence, candidate/environment/policy-bound
+  verification, durable runs/events/checkpoints, and bounded autonomous-loop
+  resume;
+- typed plan-first publication with candidate/ref rechecks and scoped execute
+  confirmation.
 
-- State: typed security authority implemented and checkpointed on local
-  `main`.
-- Commit: `7243fa9` (`m3.2: execution security policy`).
-- Scope: deny-by-default capabilities, repository enrollment and trusted
-  integration references, principal/session binding, nonce replay protection,
-  confirmation classes, mount/network/execution compilation, credential
-  references, and redacted audit events.
-- Tests: adversarial unit tests cover deny-by-default, replay, TOCTOU-bound
-  enrollment, live/workspace overlap, full-network and host-shell rejection,
-  confirmation reuse, and redaction.
-- Decisions: see `docs/adr/0002-m3.2-typed-execution-security.md`.
-- Remaining: M3.3 typed supervised process layer with bounded output,
-  cancellation, timeout, process-group cleanup, cursors, spill, signals, and
-  optional PTY.
-- Exact next action: define `ProcessSpec` and the supervised process contract,
-  bind it to the M3.2 runtime policy, and add leak/race/timeout tests.
+Production MCP has no generic shell, host_exec, arbitrary patch, file creation,
+branch switching, or worktree tools. Public output omits host state paths.
 
-## M3.3 — GREEN
+## Evidence gates
 
-- State: typed supervised process layer implemented and checkpointed on local
-  `main`.
-- Commit: `0ef2f57` (`m3.3: supervised process layer`).
-- Scope: `ProcessSpec`, starter abstraction, monotonic stdout/stderr/PTY
-  cursors, bounded memory with durable spill, cancellation/timeout and
-  process-group cleanup, signals, environment rejection, and optional PTY.
-- Tests: process unit tests cover cursor resume, spill permissions, timeout,
-  cancellation, signal cleanup, PTY gating, and credential environment denial.
-- Decisions: see `docs/adr/0003-m3.3-supervised-processes.md`.
-- Remaining: M3.4 runtime backend abstraction with Apple container primary,
-  Lima fallback/test adapter, lifecycle state, isolated workspace mounts,
-  network/resource defaults, identity binding, and crash cleanup.
-- Exact next action: define the `RuntimeBackend` contract and lifecycle state
-  machine, then add Apple container/Lima adapters with mount and network tests.
+- Warm verification: `make verify`.
+- Offline verification: `make bootstrap` followed by `make offline-verify`.
+- Fresh-cache proof: `scripts/cold-cache-verify.sh`.
+- Real Apple lifecycle: `go test ./internal/runtime -run
+  TestAppleContainerRealLifecycle -count=1 -v` when the container machine is
+  available.
+- Real M3 E2E: `REPOWORKER_REAL_E2E=1 go test ./internal/controlplane -run
+  TestControlPlaneRealM3EndToEnd -count=1 -v`.
 
-## M3.4 — GREEN
+The real Apple test covers workspace-only mount, no-network behavior,
+resource evidence, supervised execution, stale leases, and crash recovery.
+The E2E test covers workspace, runtime, process, bound verification, durable
+loop, publication plan, confirmation-gated integration, and live-repository
+isolation.
 
-- State: runtime lifecycle and adapters implemented and checkpointed on local
-  `main`.
-- Commit: `53fbdd5` (`m3.4: isolated Apple container runtime`).
-- Scope: typed lifecycle states, one runtime per generation, Apple container
-  primary CLI adapter, Lima fallback/test adapter, isolated mount binding,
-  default no-network, CPU/RAM limits, identity binding, persisted lifecycle,
-  and crash cleanup/quarantine.
-- Tests: runtime tests cover lifecycle, duplicate admission, live mount
-  overlap, stale lease, persisted crash recovery, and Apple command binding.
-- Decisions: see `docs/adr/0004-m3.4-isolated-runtime.md`.
-- Remaining: M3.5 resource-aware parallel execution with CPU/RAM admission,
-  weighted fairness, dependency DAG, cancellation/backpressure, quotas, and
-  host-pressure response.
-- Exact next action: define deterministic resource admission and scheduler
-  contracts, then add stress/race/DAG tests.
+## Known limitations
 
-## M3.5 — GREEN
+- The default publication adapter is disabled; external GitHub/release/Dagger/
+  Dagu execution still needs an explicitly configured short-lived gate and
+  credentials supplied by the operator outside RepoWorker state.
+- Environment installation is registry-bound but no production installer is
+  enabled in the composition root; verification images must already contain
+  the required toolchain.
+- The local tunnel is an external connector process. If it caches an older MCP
+  schema, reconnect/re-add the connector and open a new session.
 
-- State: resource-aware scheduler implemented and checkpointed on local
-  `main`.
-- Commit: `56a6441` (`m3.5: resource-aware scheduler`).
-- Scope: CPU/RAM admission, weighted fair ready selection, dependency DAG,
-  bounded submission/backpressure, task/runtime quotas, controlled
-  concurrency, errgroup-equivalent cancellation propagation, and host
-  pressure response.
-- Tests: scheduler tests cover DAG ordering, resource limits, cycle rejection,
-  backpressure, sibling cancellation, host pressure, unschedulable jobs, and
-  submitted queue execution.
-- Decisions: see `docs/adr/0005-m3.5-resource-aware-scheduler.md`.
-- Remaining: M3.6 reproducible environment generations, toolchain detection,
-  lockfile identities, runtime package installation, registry-only network
-  phases, and cache poisoning/cold-cache equivalence protection.
-- Exact next action: define environment and cache identities bound to
-  toolchain/platform/lockfile/policy, then add cold/warm/corrupt-cache tests.
+## Exact next action
 
-## M3.6 — GREEN
-
-- State: reproducible environment and cache layer implemented and checkpointed
-  on local `main`.
-- Commit: `9165206` (`m3.6: reproducible environments and cache`).
-- Scope: deterministic Go/Node/Rust/Nx/Turbo/Bazel manifest detection,
-  lockfile hashing, environment generations, registry-only installer boundary,
-  cache provenance/content verification, poisoning rejection, and cold-cache
-  correctness path.
-- Tests: environment tests cover deterministic detection/hash, registry-only
-  install, cold/warm equivalence, policy-bound cache keys, corruption, cache
-  deletion, and symlink manifests.
-- Decisions: see `docs/adr/0006-m3.6-reproducible-environments.md`.
-- Remaining: M3.7 deterministic repository intelligence adapters and
-  candidate/environment/policy-bound verification.
-- Exact next action: implement native Go/Node/Rust/Nx/Turbo/Bazel detection,
-  targeted/full verification plans, and invalidate results on snapshot change.
-
-## M3.7 — GREEN
-
-- State: repository intelligence and bound verification implemented and
-  checkpointed on local `main`.
-- Commit: `8b7f704` (`m3.7: repository intelligence and verification`).
-- Scope: native ecosystem detection, package-manager selection, targeted/
-  affected/full command plans, candidate snapshot checks before/after
-  execution, environment/policy binding, and stale-result invalidation.
-- Tests: intelligence fixtures cover all six supported ecosystems, native
-  command selection, target validation, failure redaction, and TOCTOU snapshot
-  changes.
-- Decisions: see `docs/adr/0007-m3.7-bound-verification.md`.
-- Remaining: M3.8 durable runs/events/artifacts/checkpoints, cursor-resumable
-  logs, retention/GC, FSEvents invalidation hints, and crash/restart replay.
-- Exact next action: design the durable event schema and append-only replay
-  contract, then add retention and restart tests.
-
-## M3.8 — GREEN
-
-- State: durable run/event/artifact/checkpoint substrate implemented and
-  checkpointed on local `main`.
-- Commit: `866dd01` (`m3.8: durable runs and events`).
-- Scope: private SQLite runs, ordered append-only events, cursor-resumable log
-  reads, digest-verified private artifacts, immutable checkpoints, terminal-run
-  retention GC, and advisory FSEvents-style invalidation hints.
-- Tests: focused tests cover restart replay, missing-run rejection, cursor
-  ordering, artifact corruption, retention cleanup, payload rejection, and
-  invalidation-hint consumption.
-- Decisions: see `docs/adr/0008-m3.8-durable-events.md`.
-- Verification: `make verify` and `GOCACHE=.cache/go-build govulncheck ./...`
-  are green; Lima validation is OK with host-only detection warnings.
-- Remaining: M3.9 autonomous-loop state and bounded continuation/recovery.
-- Exact next action: define the persisted autonomous-loop state machine and
-  failure taxonomy, then add fake-model crash/resume and retry-convergence
-  tests.
-
-## M3.9 — GREEN
-
-- State: fixed typed autonomous coding loop implemented and checkpointed on
-  local `main`.
-- Commit: `6b97b18` (`m3.9: autonomous coding loop`).
-- Scope: persisted inspect/hypothesis/plan/parallel-command/patch/targeted
-  test/diagnose/full-verify/checkpoint phases, bounded retries, failure
-  taxonomy, action-fingerprint convergence, snapshot/environment/policy
-  binding, crash resume, and human gating for destructive or ambiguous plans.
-- Tests: scripted fake-model tests cover phase persistence, checkpoint replay,
-  crash/resume, retry convergence, destructive-plan human checkpoint, and
-  binding rejection.
-- Decisions: see `docs/adr/0009-m3.9-autonomous-loop.md`.
-- Verification: `make verify` and `GOCACHE=.cache/go-build govulncheck ./...`
-  are green; Lima validation is OK with host-only detection warnings.
-- Remaining: M3.10 disabled-by-default publication adapters with dry-run and
-  explicit confirmation.
-- Exact next action: define the publication authority and adapters, then add
-  local bare-remote, fake-CLI, dry-run, and authorization tests.
-
-## M3.10 — GREEN
-
-- State: verified publication adapters implemented and checkpointed on local
-  `main`.
-- Commit: `e240f97` (`m3.10: verified publication adapters`).
-- Scope: Git and jj local checkpoints, Git push, GitHub PR via fixed `gh` command,
-  release, Dagger, and Dagu adapters; candidate snapshot revalidation, remote
-  ref race check, dry-run default, disabled-by-default external mutation,
-  scoped confirmation token, and credential-free command arguments.
-- Tests: fake CLI/dry-run authorization tests plus a local bare Git remote
-  fixture cover stale candidates, remote recheck, push result, and token gates.
-- Decisions: see `docs/adr/0010-m3.10-publication.md`.
-- Verification: focused publication race tests, `make verify`, and
-  `GOCACHE=.cache/go-build govulncheck ./...` are green; Lima validation is OK
-  with host-only detection warnings.
-- Remaining: final clean working-tree handoff without pushing.
-- Exact next action: perform final clean-main verification and handoff.
+Run the final clean-main gate, confirm the tunnel is ready, and commit the
+verified implementation locally on main. Do not push the remote.

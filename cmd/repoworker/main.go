@@ -4,13 +4,15 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/tienphat/m3-repoworker/internal/repo"
-	"github.com/tienphat/m3-repoworker/internal/taskstate"
-	"github.com/tienphat/m3-repoworker/internal/verify"
 	"io"
 	"log"
 	"os"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/tienphat/m3-repoworker/internal/controlplane"
+	"github.com/tienphat/m3-repoworker/internal/repo"
+	"github.com/tienphat/m3-repoworker/internal/taskstate"
+	"github.com/tienphat/m3-repoworker/internal/verify"
 )
 
 type StatusInput struct{}
@@ -112,21 +114,12 @@ var errRequestRejected = errors.New("request rejected")
 
 func boolPtr(v bool) *bool { return &v }
 
-func newServer(repoRoot, stateRoot string) (*mcp.Server, *repo.Workspace, error) {
-	workspace, err := repo.New(repoRoot)
+func newServer(repoRoot, stateRoot string) (*mcp.Server, *controlplane.Plane, error) {
+	plane, err := controlplane.Open(context.Background(), controlplane.Config{RepositoryRoot: repoRoot, StateRoot: stateRoot})
 	if err != nil {
 		return nil, nil, errRequestRejected
 	}
-	tasks, err := taskstate.New(workspace.StartupPath(), workspace.RootIdentity(), stateRoot)
-	if err != nil {
-		_ = workspace.Close()
-		return nil, nil, errRequestRejected
-	}
-	if err := tasks.RequireMain(context.Background()); err != nil {
-		_ = workspace.Close()
-		return nil, nil, errRequestRejected
-	}
-	return newServerForComponents(workspace, tasks, stateRoot), workspace, nil
+	return newControlPlaneServer(plane), plane, nil
 }
 
 func newServerForComponents(workspace *repo.Workspace, tasks taskstate.StateStore, stateRoot string) *mcp.Server {
@@ -477,12 +470,12 @@ func main() {
 }
 
 func run(ctx context.Context, transport mcp.Transport, repoRoot, stateRoot string) error {
-	server, workspace, err := newServer(repoRoot, stateRoot)
+	server, plane, err := newServer(repoRoot, stateRoot)
 	if err != nil {
 		return errRequestRejected
 	}
 	defer func() {
-		_ = workspace.Close()
+		_ = plane.Close()
 	}()
 	err = server.Run(ctx, transport)
 	if errors.Is(err, io.EOF) {

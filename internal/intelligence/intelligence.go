@@ -169,7 +169,7 @@ func Verify(ctx context.Context, plan VerificationPlan, snapshots SnapshotProvid
 }
 
 func ValidResult(result VerificationResult, plan VerificationPlan, currentSnapshot, environmentID, policyVersion string) bool {
-	return result.PlanDigest == plan.PlanDigest && result.RepositoryID == plan.RepositoryID && result.CandidateSnapshot == currentSnapshot && result.EnvironmentID == environmentID && result.PolicyVersion == policyVersion && result.VerifiedAt.After(time.Time{}) && result.PlanDigest != ""
+	return result.Passed && result.PlanDigest == plan.PlanDigest && result.RepositoryID == plan.RepositoryID && result.CandidateSnapshot == currentSnapshot && result.EnvironmentID == environmentID && result.PolicyVersion == policyVersion && result.VerifiedAt.After(time.Time{}) && result.PlanDigest != ""
 }
 
 func commandFor(info RepositoryInfo, ecosystem Ecosystem, target Target) (Command, error) {

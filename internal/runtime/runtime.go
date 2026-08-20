@@ -217,6 +217,39 @@ func (m *Manager) Delete(ctx context.Context, generationID string, lease workspa
 	return os.Remove(m.runtimePath(runtime.ID))
 }
 
+// Status returns the persisted runtime record for one generation without
+// changing lifecycle state. Callers still need a valid lease before using the
+// runtime for execution.
+func (m *Manager) Status(ctx context.Context, generationID string) (Runtime, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if ctx == nil || m == nil || generationID == "" {
+		return Runtime{}, ErrRejected
+	}
+	runtime, ok := m.runtimes[generationID]
+	if !ok {
+		return Runtime{}, ErrRejected
+	}
+	return runtime, nil
+}
+
+// Lookup resolves an opaque runtime ID to its persisted record. It is used by
+// the process starter; callers still perform lease and lifecycle checks before
+// execution.
+func (m *Manager) Lookup(ctx context.Context, runtimeID string) (Runtime, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if ctx == nil || m == nil || runtimeID == "" {
+		return Runtime{}, ErrRejected
+	}
+	for _, runtime := range m.runtimes {
+		if runtime.ID == runtimeID {
+			return runtime, nil
+		}
+	}
+	return Runtime{}, ErrRejected
+}
+
 // Recover cleans up persisted runtimes left in an active lifecycle state after
 // a manager crash. Failed cleanup is quarantined for explicit inspection.
 func (m *Manager) Recover(ctx context.Context) error {

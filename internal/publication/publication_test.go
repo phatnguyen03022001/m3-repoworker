@@ -33,10 +33,15 @@ func TestPublicationDryRunAndAuthorization(t *testing.T) {
 	if err != nil || !result.DryRun || len(runner.commands) != 0 || result.Commands[0].Executable != "gh" {
 		t.Fatalf("dry-run = %#v commands=%#v err=%v", result, runner.commands, err)
 	}
+	zeroMode, err := adapter.Publish(context.Background(), testCandidate, Request{Kind: KindGitHubPR, Base: "main", Head: "candidate", Title: "zero mode", Body: "verified candidate"})
+	if err != nil || !zeroMode.DryRun || len(runner.commands) != 0 {
+		t.Fatalf("omitted mode must be plan-only: %#v, err %v", zeroMode, err)
+	}
 	jjResult, err := adapter.Publish(context.Background(), testCandidate, Request{Kind: KindJJCheckpoint, DryRun: true, Title: "jj checkpoint"})
 	if err != nil || jjResult.Commands[0].Executable != "jj" {
 		t.Fatalf("jj dry-run = %#v, %v", jjResult, err)
 	}
+	request.Mode = ModeExecute
 	request.DryRun = false
 	if _, err := adapter.Publish(context.Background(), testCandidate, request); !errors.Is(err, ErrDisabled) {
 		t.Fatalf("disabled error = %v", err)
@@ -80,6 +85,7 @@ func TestGitPushRechecksLocalBareRemote(t *testing.T) {
 	if err != nil || !result.DryRun || result.RemoteBefore != "" {
 		t.Fatalf("dry push = %#v, %v", result, err)
 	}
+	request.Mode = ModeExecute
 	request.DryRun = false
 	request.ConfirmationToken = "confirm"
 	result, err = adapter.Publish(context.Background(), candidate, request)

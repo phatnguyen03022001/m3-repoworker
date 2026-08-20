@@ -111,6 +111,113 @@ func TestRepoStatusTool(t *testing.T) {
 	}
 }
 
+func TestProductionMCPToolSurface(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "go.mod"), "module example.invalid/fixture\n\ngo 1.26.6\n")
+	writeFile(t, filepath.Join(root, "main.go"), "package main\n\nfunc main() {}\n")
+	for _, args := range [][]string{
+		{"init", "-b", "main"},
+		{"config", "user.name", "RepoWorker Test"},
+		{"config", "user.email", "repoworker@example.invalid"},
+		{"add", "."},
+		{"commit", "-m", "initial"},
+	} {
+		commandArgs := append([]string{"-C", root}, args...)
+		if output, err := exec.Command("git", commandArgs...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+	server, plane, err := newServer(root, t.TempDir())
+	if err != nil {
+		t.Fatalf("newServer() error = %v", err)
+	}
+	t.Cleanup(func() { _ = plane.Close() })
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(context.Background(), serverTransport, nil)
+	if err != nil {
+		t.Fatalf("connect server: %v", err)
+	}
+	t.Cleanup(func() { _ = serverSession.Close() })
+	client := mcp.NewClient(&mcp.Implementation{Name: "surface-test-client", Version: "0.0.0"}, nil)
+	clientSession, err := client.Connect(context.Background(), clientTransport, nil)
+	if err != nil {
+		t.Fatalf("connect client: %v", err)
+	}
+	t.Cleanup(func() { _ = clientSession.Close() })
+	tools, err := clientSession.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	toolByName := make(map[string]*mcp.Tool, len(tools.Tools))
+	for _, tool := range tools.Tools {
+		toolByName[tool.Name] = tool
+	}
+	for _, name := range []string{
+		"repo_status", "repo_read", "repo_search", "repo_snapshot",
+		"workspace_create", "workspace_status", "workspace_discard", "workspace_integration_plan", "workspace_integrate",
+		"runtime_create", "runtime_start", "runtime_stop", "runtime_status",
+		"process_run", "process_read", "process_signal", "process_cancel", "process_wait",
+		"verification_plan", "verification_run", "verification_status",
+		"run_create", "run_event_append", "run_events",
+		"loop_start", "loop_resume", "loop_status", "publication_plan", "publication_execute",
+	} {
+		if toolByName[name] == nil {
+			t.Errorf("production tool %q is missing", name)
+		}
+	}
+	for _, name := range []string{"apply_patch", "create_file", "delete_file", "host_exec", "shell"} {
+		if toolByName[name] != nil {
+			t.Errorf("unsafe or maintenance-only tool %q is exposed in production", name)
+		}
+	}
+	if len(tools.Tools) < 29 {
+		t.Fatalf("production tool count = %d, want at least 29 typed tools", len(tools.Tools))
+	}
+}
+
+func TestProductionRepoVerifyPresetsSequentially(t *testing.T) {
+	if os.Getenv("REPOWORKER_RUN_PRESET_SEQUENCE") != "1" {
+		t.Skip("set REPOWORKER_RUN_PRESET_SEQUENCE=1 for the explicit sequential repo_verify gate")
+	}
+	if os.Getenv(verify.InternalPresetEnvironment) != "" {
+		t.Skip("fixed preset execution must not recursively invoke the sequential gate")
+	}
+	if testing.Short() {
+		t.Skip("long verification sequence")
+	}
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, plane, err := newServer(root, t.TempDir())
+	if err != nil {
+		t.Fatalf("newServer() error = %v", err)
+	}
+	t.Cleanup(func() { _ = plane.Close() })
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(context.Background(), serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = serverSession.Close() })
+	client := mcp.NewClient(&mcp.Implementation{Name: "preset-sequence-client", Version: "0.0.0"}, nil)
+	clientSession, err := client.Connect(context.Background(), clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = clientSession.Close() })
+	for _, check := range []string{"fmt", "test", "test-race", "vet", "mcp-integration", "verify"} {
+		result, err := clientSession.CallTool(context.Background(), &mcp.CallToolParams{Name: "repo_verify", Arguments: map[string]any{"check": check}})
+		if err != nil || result.IsError {
+			t.Fatalf("repo_verify(%s) result = %#v, error = %v", check, result, err)
+		}
+		output := structuredMap(t, result)
+		if output["passed"] != true {
+			t.Fatalf("repo_verify(%s) output = %#v", check, output)
+		}
+	}
+}
+
 func TestRunTreatsEOFAsCleanShutdown(t *testing.T) {
 	t.Parallel()
 

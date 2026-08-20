@@ -321,6 +321,11 @@ func TestRunCancellationKillsProcessGroup(t *testing.T) {
 		result <- err
 	}()
 	waitForRunnerFile(t, filepath.Join(rootPath, "ready"))
+	// Under the race detector the shell can be interrupted between writing the
+	// readiness marker and recording the child PID. Wait for both artifacts so
+	// cancellation tests the process-group cleanup contract rather than that
+	// scheduling window.
+	waitForRunnerFile(t, filepath.Join(rootPath, "child.pid"))
 	cancel()
 	if err := <-result; !errors.Is(err, context.Canceled) {
 		t.Fatalf("runWithTimeout(cancel) error = %v, want context.Canceled", err)
@@ -352,7 +357,7 @@ func waitForRunnerFile(t *testing.T, path string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		if _, err := os.Stat(path); err == nil {
+		if content, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(content))) > 0 {
 			return
 		}
 		if time.Now().After(deadline) {

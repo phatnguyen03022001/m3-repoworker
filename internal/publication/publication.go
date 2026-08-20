@@ -29,6 +29,13 @@ const (
 	KindDagu          Kind = "dagu"
 )
 
+type Mode string
+
+const (
+	ModePlan    Mode = "plan"
+	ModeExecute Mode = "execute"
+)
+
 type Candidate struct {
 	RepositoryRoot    string
 	CandidateSnapshot string
@@ -39,7 +46,10 @@ type Candidate struct {
 }
 
 type Request struct {
-	Kind              Kind
+	Kind Kind
+	Mode Mode
+	// DryRun is retained for source compatibility; omitted Mode is always a
+	// plan, so a zero-value request can never execute a mutation.
 	DryRun            bool
 	ConfirmationToken string
 	Remote            string
@@ -84,6 +94,17 @@ type Adapter struct {
 	snapshot SnapshotProvider
 }
 
+// WithGate returns a short-lived adapter sharing the same bounded runner and
+// snapshot authority but using the supplied execution gate. The default
+// adapter remains disabled, so callers must opt into a separately authorized
+// execution instance for every mutation.
+func (a *Adapter) WithGate(gate Gate) (*Adapter, error) {
+	if a == nil || a.runner == nil || a.snapshot == nil || len(gate.ConfirmationToken) > 256 || strings.ContainsAny(gate.ConfirmationToken, "\x00\r\n") {
+		return nil, ErrRejected
+	}
+	return &Adapter{gate: gate, runner: a.runner, snapshot: a.snapshot}, nil
+}
+
 func New(gate Gate, runner Runner, snapshot SnapshotProvider) (*Adapter, error) {
 	if runner == nil || snapshot == nil || len(gate.ConfirmationToken) > 256 || strings.ContainsAny(gate.ConfirmationToken, "\x00\r\n") {
 		return nil, ErrRejected
@@ -92,7 +113,7 @@ func New(gate Gate, runner Runner, snapshot SnapshotProvider) (*Adapter, error) 
 }
 
 func (a *Adapter) Publish(ctx context.Context, candidate Candidate, request Request) (Result, error) {
-	if ctx == nil || a == nil || !validCandidate(candidate) || !validRequest(request) || request.DryRun && request.ConfirmationToken != "" {
+	if ctx == nil || a == nil || !validCandidate(candidate) || !validRequest(request) || request.Mode == ModePlan && request.ConfirmationToken != "" {
 		return Result{}, ErrRejected
 	}
 	if current, err := a.snapshot(ctx, candidate.RepositoryRoot); err != nil || current != candidate.CandidateSnapshot || candidate.VerifiedSnapshot != candidate.CandidateSnapshot {
@@ -102,7 +123,11 @@ func (a *Adapter) Publish(ctx context.Context, candidate Candidate, request Requ
 	if err != nil {
 		return Result{}, err
 	}
-	result := Result{Kind: request.Kind, DryRun: request.DryRun, Commands: commands}
+	dryRun := request.Mode != ModeExecute
+	if request.DryRun {
+		dryRun = true
+	}
+	result := Result{Kind: request.Kind, DryRun: dryRun, Commands: commands}
 	if request.Kind == KindGitPush {
 		before, err := a.remoteRef(ctx, candidate.RepositoryRoot, request)
 		if err != nil {
@@ -113,7 +138,7 @@ func (a *Adapter) Publish(ctx context.Context, candidate Candidate, request Requ
 			return Result{}, ErrStale
 		}
 	}
-	if request.DryRun {
+	if dryRun {
 		return result, nil
 	}
 	if !a.gate.Enabled {
@@ -229,7 +254,7 @@ func validCandidate(candidate Candidate) bool {
 	return candidate.Verified && filepath.IsAbs(candidate.RepositoryRoot) && filepath.Clean(candidate.RepositoryRoot) == candidate.RepositoryRoot && validIdentity(candidate.CandidateSnapshot) && candidate.CandidateSnapshot == candidate.VerifiedSnapshot && candidate.EnvironmentID != "" && candidate.PolicyVersion != ""
 }
 func validRequest(request Request) bool {
-	return request.Kind != "" && len(request.ConfirmationToken) <= 256 && !strings.ContainsAny(request.ConfirmationToken, "\x00\r\n")
+	return request.Kind != "" && (request.Mode == "" || request.Mode == ModePlan || request.Mode == ModeExecute) && len(request.ConfirmationToken) <= 256 && !strings.ContainsAny(request.ConfirmationToken, "\x00\r\n")
 }
 func validIdentity(value string) bool { return len(value) == 64 && validHex(value) }
 func validHex(value string) bool {

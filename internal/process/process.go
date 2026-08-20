@@ -47,13 +47,17 @@ type Chunk struct {
 type Cursor uint64
 
 type ProcessSpec struct {
-	Execution   security.CompiledExecution
-	Environment []string
-	Interactive bool
-	PTY         bool
-	Timeout     time.Duration
-	MemoryBytes int
-	ChunkBytes  int
+	TaskID              string
+	WorkspaceGeneration string
+	LeaseGeneration     uint64
+	RuntimeID           string
+	Execution           security.CompiledExecution
+	Environment         []string
+	Interactive         bool
+	PTY                 bool
+	Timeout             time.Duration
+	MemoryBytes         int
+	ChunkBytes          int
 }
 
 type Outcome struct {

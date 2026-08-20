@@ -1,204 +1,108 @@
 # RepoWorker
 
-RepoWorker is a local Model Context Protocol (MCP) server. It exposes closed-
-world repository status, confined repository read/search/patch tools, and
-persistent development task handoff over stdio.
+RepoWorker is a local, authenticated MCP control plane for a main-only Go
+repository. Production requests use typed workspace, Apple-container runtime,
+supervised-process, bound-verification, durable-run, autonomous-loop, and
+plan-first publication operations. The live checkout is never mounted into a
+task runtime.
 
-## Local development
+## Khởi động nhanh
 
-Requirements: Go 1.26.6, Git, and Lima (only for validating the supplied VM
-template).
-
-```sh
-make verify
-```
-
-The command runs formatting, static analysis, normal and race-detector tests,
-the MCP integration tests, `go mod verify`, a reproducible local build, and
-Lima template validation. The executable is written to `bin/repoworker`.
-
-To run the server directly, explicitly configure the repository root:
+Từ thư mục `/Users/tienphat/Developer/m3-repoworker`:
 
 ```sh
-go run ./cmd/repoworker -repo-root /absolute/path/to/repository
+# Reset state local an toàn, build/verify, và restart tunnel
+./scripts/reset-local.sh
 ```
 
-Persistent task state defaults to the per-user configuration directory outside
-the repository. An explicit absolute state directory may be supplied when
-needed:
+Nếu chỉ muốn chạy process trực tiếp:
 
 ```sh
 go run ./cmd/repoworker \
-  -repo-root /absolute/path/to/repository \
-  -state-dir /absolute/path/to/private/state
-```
-
-The same `-repo-root` argument must be present when another process such as
-`tunnel-client` launches `bin/repoworker`; the binary intentionally has no
-implicit repository root. If `-state-dir` is supplied it must also remain
-outside the configured repository.
-
-### Local tunnel operations
-
-The configured local tunnel uses the `local-stdio` profile at
-`~/.config/tunnel-client/local-stdio.yaml`. The profile launches:
-
-```text
-/Users/tienphat/Developer/m3-repoworker/bin/repoworker \
   -repo-root /Users/tienphat/Developer/m3-repoworker \
-  -state-dir /Users/tienphat/.repoworker-state
+  -state-dir "$HOME/.repoworker-state"
 ```
 
-The restart scripts supply the explicit `-state-dir` override so stale state
-does not prevent MCP startup.
-
-Build and verify the binary before starting or restarting the tunnel:
-
-```sh
-make verify
-```
-
-The credential is supplied through `CONTROL_PLANE_API_KEY`; do not print or
-commit its value. The credential-safe restart wrapper loads `.env` privately,
-stops the old listener, and starts a single tunnel on `127.0.0.1:8080`:
+Nếu tunnel đã được cấu hình:
 
 ```sh
 ./scripts/restart-local-tunnel.sh
 ```
 
-For a one-command local reset, use the reset wrapper. It verifies and rebuilds
-the binary, moves the selected state directory to a timestamped backup, starts
-with a fresh state directory outside the repository, and waits for tunnel
-readiness:
+`reset-local.sh` không xoá state cũ: nó di chuyển state sang thư mục backup có
+timestamp. Có thể đổi vị trí state bằng `REPOWORKER_STATE_DIR`.
+
+## Local development
+
+Requirements: Go 1.26.6, Git, Apple `container` CLI plus a running container
+machine for real runtime tests, and Lima only for validating the supplied VM
+template.
 
 ```sh
-./scripts/reset-local.sh
+make bootstrap
+make verify
+make offline-verify
+./scripts/cold-cache-verify.sh
 ```
 
-Set `REPOWORKER_STATE_DIR` to choose a different private state location. The
-old state is moved aside and is not deleted.
+Các lệnh Go dùng cache riêng trong `.cache/`; `offline-verify` chỉ chạy sau khi
+`bootstrap` đã tải đủ module. `make verify` chạy format, vet, test thường và
+race, typed MCP surface tests, module verification, build reproducible, và
+Lima validation. Binary nằm ở `bin/repoworker`.
 
-The equivalent direct start command, when `CONTROL_PLANE_API_KEY` is already
-exported in the shell, is:
+Apple prerequisite:
 
 ```sh
-tunnel-client run --profile local-stdio
+container machine create --name repoworker alpine:3.22
 ```
 
-Check configuration and runtime health without exposing credentials:
+Real Apple E2E dùng `REPOWORKER_REAL_E2E=1`; image có thể chỉ định bằng
+`REPOWORKER_APPLE_VERIFY_IMAGE`.
+
+## Local tunnel
+
+Tunnel dùng profile `local-stdio` tại
+`~/.config/tunnel-client/local-stdio.yaml`, repository/state path rõ ràng, và
+listen trên `127.0.0.1:8080`. Credential chỉ đọc riêng từ
+`CONTROL_PLANE_API_KEY`:
 
 ```sh
+./scripts/restart-local-tunnel.sh
 tunnel-client doctor --profile local-stdio --explain
-lsof -nP -iTCP:8080 -sTCP:LISTEN
-curl -fsS http://127.0.0.1:8080/healthz
 curl -fsS http://127.0.0.1:8080/readyz
-tail -f /private/tmp/m3-tunnel.log
 ```
 
-Confirm the local binary still advertises all 12 RepoWorker tools:
+Nếu ChatGPT hiển thị schema cũ sau khi local test và tunnel đều đúng, hãy
+reconnect hoặc remove/re-add MCP connector rồi mở session mới; connector có
+thể đang cache schema cũ.
 
-```sh
-go test ./cmd/repoworker -run TestRepoStatusTool -count=1
-```
+## Production MCP surface
 
-If ChatGPT shows an older 7-tool schema while the local test and tunnel logs
-are correct, reconnect or remove and re-add the MCP connector, then open a new
-ChatGPT session. This refreshes the external connector registration; changing
-RepoWorker is not a workaround for a cached connector schema.
+Production chỉ expose typed tools: `repo_*`, `workspace_*`, `runtime_*`,
+`process_*`, `verification_*`, `run_*`, `loop_*`, `publication_plan`,
+`publication_execute`, và `confirmation_issue`. Không có client shell, host
+execution, arbitrary file mutation, branch switching, hay worktree creation.
+Candidate edit chỉ xảy ra trong TaskWorkspace đã lease và qua autonomous loop
+bị giới hạn.
 
-The server uses newline-delimited JSON on standard input and output. Do not
-write human-readable logs to standard output: that stream is reserved for MCP
-messages.
+Verification bind repository, candidate snapshot, environment, và policy.
+MCP output dùng opaque IDs và `/workspace`; không trả về state path hay spill
+file. Publication mặc định là plan-only; execute cần verification còn hiệu
+lực, ref recheck nếu có, và one-time confirmation. External adapters mặc định
+disabled.
 
-## Main-only authority
+## Main-only và security
 
-RepoWorker enforces a main-only development policy independently of client
-prompts or agent guidance. The configured checkout must be on `main` at
-startup, and every mutating tool re-checks the trusted Git branch before it
-runs. `task_create` and `task_resume` bind only to `main`; a non-main checkout
-fails closed with `repository must be on main`. RepoWorker exposes no branch or
-worktree creation/switching tools, and clients cannot override this policy.
+Checkout phải ở `main` khi khởi động; mọi mutation re-check trusted branch.
+State nằm ngoài checkout với quyền private. Path là relative, bounded,
+symlink-safe, không chạm `.git`, credential stores, hay state root. Apple
+runtime chỉ mount workspace cô lập, no-network mặc định, và chạy argv
+allow-list qua supervised process group.
 
-## Security boundaries
+Rejected MCP request trả về `request rejected`; credential không được ghi vào
+environment/event payload hoặc command arguments.
 
-- The MCP server uses stdio only; it does not open a network listener.
-- A repository root is mandatory, must be an existing absolute directory, and
-  is canonicalized before use. Repo paths are always relative to that root.
-  Absolute paths, `..` traversal, Windows volume paths, backslashes, and
-  symlink escapes are rejected.
-- The repository root is also opened once at startup and assigned an opaque
-  filesystem identity derived from its device/inode identity. New task state is
-  bound to that identity. Repository read, search, and patch operations resolve
-  from the opened root with FD-relative operations, `O_NOFOLLOW`, and device-
-  crossing checks rather than reopening the startup pathname.
-- `repo_read` and `repo_search` only handle bounded UTF-8 regular files. They
-  do not follow symlinks while searching and never expose `.git`, `.env`,
-  `.env.*`, common credential/secret/token stores, private keys, or common key
-  stores. Source-code files such as `token.go` remain accessible so security
-  and authentication code can still be edited.
-- Repository search is bounded by query size, per-file size, match count,
-  scanned file count, scanned bytes, MCP output size, and per-match preview
-  size. Search also honors MCP request cancellation. A truncated result is
-  reported with `truncated: true`.
-- `apply_patch` accepts exactly one existing, non-symlink UTF-8 file and one
-  strict unified diff (`--- a/path`, `+++ b/path`). Every hunk must match
-  exactly, later and multi-hunk offsets are validated against the original
-  file, and the replacement is atomic. File mutations are serialized so two
-  concurrent patches cannot both commit from the same stale snapshot.
-- `apply_patch` rejects file creation, deletion, renames, multi-file patches,
-  and protected paths.
-- `task_create` generates the task identifier itself, binds the task to a hash
-  of the canonical repository root plus `main` and the current commit, and
-  initializes verification state to `RED`.
-- `task_status` reads only persisted state. `task_resume` refuses a repository
-  mismatch or any checkout that is not on `main`; if the `main` HEAD moved, it
-  updates `current_head_sha` and forces the task back to `RED`.
-- Task state is written outside the repository with private directory/file
-  permissions, atomic replace, file and directory sync, bounded strict JSON
-  decoding, and repository-identity checks. Corrupt or mismatched state fails
-  closed.
-- Git use is limited to fixed local metadata reads (`rev-parse` and
-  `symbolic-ref`) with no shell, hooks, prompts, network operations, or arbitrary
-  command input. RepoWorker still has no GitHub credentials and cannot publish.
-- Rejected MCP requests return only `request rejected`, except for the safe
-  policy message `repository must be on main`; they never return a filesystem
-  path, repository root, protected filename, task-state location, or underlying
-  host error.
-- `repo_status`, `repo_read`, `repo_search`, and `task_status` are read-only,
-  idempotent, non-destructive, and closed-world. `apply_patch` is explicitly
-  destructive. `task_create` and `task_resume` mutate only RepoWorker-owned
-  handoff state and are non-destructive to repository contents.
-- `repoworker-prod.yaml` preserves the hardened Lima isolation baseline: no
-  host mounts, no configured guest networks, SSH over VSOCK disabled, and an
-  ignored forwarding rule covering all guest application ports. Do not relax
-  these settings without an explicit security review.
-- Keep local credentials only in ignored `.env` or `.env.local` files. Never
-  add real credentials to source, tests, docs, generated artifacts, or task
-  state.
-
-## Task handoff state
-
-A task persists these development fields across RepoWorker restarts:
-
-- `task_id`
-- `repo_root_identity`
-- `repo_filesystem_identity`
-- `branch`
-- `base_sha`
-- `current_head_sha`
-- `last_verified_sha`
-- `verification_state` (`RED` or `GREEN`)
-- `failed_checks`
-- `next_action`
-
-`last_verified_sha` and `GREEN` are reserved for the verification layer. This
-phase never manufactures a GREEN state.
-
-## Current scope
-
-RepoWorker currently implements repository status, confined read/search,
-deterministic FD-relative snapshot manifests, strict patch application, and
-persistent task create/status/resume handoff.
-Verification execution, Gatekeeper authority, candidate binding, and publishing
-are intentionally not implemented yet. A green local `make verify` is a
-development check, not final publish authorization.
+Xem [docs/objective.md](/Users/tienphat/Developer/m3-repoworker/docs/objective.md),
+[docs/architecture.md](/Users/tienphat/Developer/m3-repoworker/docs/architecture.md),
+[docs/security-model.md](/Users/tienphat/Developer/m3-repoworker/docs/security-model.md),
+và [docs/operations.md](/Users/tienphat/Developer/m3-repoworker/docs/operations.md).

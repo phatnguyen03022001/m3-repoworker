@@ -87,7 +87,7 @@ func VerificationPreset(check string) (Preset, bool) {
 
 func InternalRequest() (Preset, bool) {
 	value, ok := os.LookupEnv(InternalPresetEnvironment)
-	return Preset(value), ok
+	return Preset(value), ok && value != ""
 }
 
 func Run(ctx context.Context, root *os.File, preset Preset, redactions []string) (Outcome, error) {
@@ -131,6 +131,11 @@ func runWithTimeout(ctx context.Context, root *os.File, preset Preset, redaction
 	command := exec.Command(executable)
 	command.ExtraFiles = []*os.File{root, controlWriter}
 	command.Env = append(helperEnvironment(), InternalPresetEnvironment+"="+string(preset))
+	for _, name := range []string{"GOCACHE", "GOMODCACHE", "GOPATH"} {
+		if value, ok := os.LookupEnv(name); ok && value != "" {
+			command.Env = append(command.Env, name+"="+value)
+		}
+	}
 	command.Stdin = nil
 	command.Stdout = capture
 	command.Stderr = capture
@@ -235,7 +240,20 @@ func RunInternal(preset Preset) int {
 	if err != nil {
 		return fail(StageStart)
 	}
-	cache, err := ensureCacheDirectories(internalRootFD, uint64(rootStat.Dev), verifiedCWD)
+	cacheRootFD, err := openOrCreateDirectoryAt(internalRootFD, ".cache", uint64(rootStat.Dev))
+	if err != nil {
+		return fail(StageStart)
+	}
+	if err := unix.Close(cacheRootFD); err != nil {
+		return fail(StageStart)
+	}
+	cache, err := configuredCacheDirectories()
+	if err != nil {
+		return fail(StageStart)
+	}
+	if cache == (cachePaths{}) {
+		cache, err = ensureCacheDirectories(internalRootFD, uint64(rootStat.Dev), verifiedCWD)
+	}
 	if err != nil {
 		return fail(StageStart)
 	}
@@ -248,7 +266,8 @@ func RunInternal(preset Preset) int {
 		return fail(StageResolve)
 	}
 	arguments := append([]string{executable}, definition.arguments...)
-	if err := unix.Exec(executable, arguments, commandEnvironment(preset, cache)); err != nil {
+	commandEnvironmentValues := append(commandEnvironment(preset, cache), InternalPresetEnvironment+"="+string(preset))
+	if err := unix.Exec(executable, arguments, commandEnvironmentValues); err != nil {
 		return fail(StageStart)
 	}
 	return 0
@@ -321,6 +340,40 @@ type cachePaths struct {
 	goBuild string
 	goMod   string
 	goPath  string
+}
+
+// configuredCacheDirectories honors the fixed cache paths supplied by the
+// controlled Makefile/bootstrap environment. It rejects symlinked roots and
+// creates private directories before the fixed preset command is executed.
+func configuredCacheDirectories() (cachePaths, error) {
+	values := []struct {
+		name string
+		path *string
+	}{
+		{name: "GOCACHE"}, {name: "GOMODCACHE"}, {name: "GOPATH"},
+	}
+	for index := range values {
+		value := os.Getenv(values[index].name)
+		if value == "" || !filepath.IsAbs(value) || filepath.Clean(value) != value || strings.ContainsAny(value, "\x00\r\n:") {
+			return cachePaths{}, nil
+		}
+		if err := os.MkdirAll(value, 0o700); err != nil {
+			return cachePaths{}, err
+		}
+		if err := os.Chmod(value, 0o700); err != nil {
+			return cachePaths{}, err
+		}
+		info, err := os.Lstat(value)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return cachePaths{}, ErrRejected
+		}
+		canonical, err := filepath.EvalSymlinks(value)
+		if err != nil || canonical != value {
+			return cachePaths{}, ErrRejected
+		}
+		values[index].path = &value
+	}
+	return cachePaths{goBuild: *values[0].path, goMod: *values[1].path, goPath: *values[2].path}, nil
 }
 
 func ensureCacheDirectories(rootFD int, rootDevice uint64, verifiedCWD string) (cachePaths, error) {
@@ -411,11 +464,15 @@ func openOrCreateDirectoryAt(parentFD int, name string, rootDevice uint64) (int,
 }
 
 func helperEnvironment() []string {
-	return []string{
+	environment := []string{
 		"PATH=" + os.Getenv("PATH"),
 		"LC_ALL=C",
 		"LANG=C",
 	}
+	if home := os.Getenv("HOME"); home != "" && filepath.IsAbs(home) && filepath.Clean(home) == home {
+		environment = append(environment, "HOME="+home)
+	}
+	return environment
 }
 
 func commandEnvironment(preset Preset, cache cachePaths) []string {
@@ -434,6 +491,9 @@ func commandEnvironment(preset Preset, cache cachePaths) []string {
 		"GOCACHE=" + cache.goBuild,
 		"GOMODCACHE=" + cache.goMod,
 		"GOPATH=" + cache.goPath,
+	}
+	if home := os.Getenv("HOME"); home != "" && filepath.IsAbs(home) && filepath.Clean(home) == home {
+		environment = append(environment, "HOME="+home)
 	}
 	if definition.network {
 		environment = append(environment,

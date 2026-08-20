@@ -99,6 +99,14 @@ type Authority interface {
 	Checkpoint(context.Context, Binding) error
 }
 
+// BindingRefresher is implemented by authorities whose candidate mutation
+// advances the snapshot. The loop then persists the new binding before any
+// targeted or full verification runs, preventing a stale plan from being
+// treated as verified.
+type BindingRefresher interface {
+	RefreshBinding(context.Context, Binding) (Binding, error)
+}
+
 type Controller struct {
 	store      *events.Store
 	model      Model
@@ -173,6 +181,22 @@ func (c *Controller) Run(ctx context.Context, request Request) (State, error) {
 					return state, err
 				}
 				break
+			}
+			if refresher, ok := c.authority.(BindingRefresher); ok {
+				binding, err := refresher.RefreshBinding(ctx, request.Binding)
+				if err != nil || !validBinding(binding) {
+					state, err = c.recordFailure(ctx, request, state, Failure{Phase: PhasePatch, Action: state.Plan.Patch, Class: "binding", Diagnostic: safeDiagnostic(err)})
+					if err != nil {
+						return state, err
+					}
+					break
+				}
+				request.Binding = binding
+				state.Binding = binding
+				state.Plan.Binding = binding
+				if err := c.store.UpdateRunBinding(ctx, request.RunID, binding.CandidateSnapshot, binding.EnvironmentID, binding.PolicyVersion); err != nil {
+					return State{}, err
+				}
 			}
 			state.Phase = PhaseTargetedTest
 		case PhaseTargetedTest:

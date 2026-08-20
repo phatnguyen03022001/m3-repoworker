@@ -188,6 +188,26 @@ func (s *Store) UpdateRunStatus(ctx context.Context, runID, status string) error
 	return nil
 }
 
+// UpdateRunBinding advances the candidate binding after an authorized
+// TaskWorkspace mutation. Repository and generation identity remain fixed;
+// only the candidate snapshot and derived environment binding may change.
+func (s *Store) UpdateRunBinding(ctx context.Context, runID, candidateSnapshot, environmentID, policyVersion string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ctx == nil || s.db == nil || !validOpaque(runID) || candidateSnapshot == "" || !validOpaque(environmentID) || !validOpaque(policyVersion) {
+		return ErrRejected
+	}
+	result, err := s.db.ExecContext(ctx, "UPDATE runs SET candidate_snapshot=?, environment_id=?, policy_version=?, updated_at=? WHERE run_id=?", candidateSnapshot, environmentID, policyVersion, time.Now().UTC().Format(time.RFC3339Nano), runID)
+	if err != nil {
+		return ErrRejected
+	}
+	affected, err := result.RowsAffected()
+	if err != nil || affected != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) GetRun(ctx context.Context, runID string) (Run, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

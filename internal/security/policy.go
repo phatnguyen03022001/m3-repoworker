@@ -33,6 +33,7 @@ const (
 	CapabilityWorkspaceRead   Capability = "workspace.read"
 	CapabilityWorkspaceWrite  Capability = "workspace.write"
 	CapabilityExecute         Capability = "runtime.execute"
+	CapabilityProcessControl  Capability = "runtime.process"
 	CapabilityRuntimeCreate   Capability = "runtime.create"
 	CapabilityNetworkRegistry Capability = "network.registry"
 	CapabilityIntegrate       Capability = "repository.integrate"
@@ -439,7 +440,7 @@ func validateTarget(request Request, binding Binding) error {
 		if request.Target != TargetLiveRepository || !validRelativePath(request.Path) {
 			return ErrDenied
 		}
-	case CapabilityWorkspaceRead, CapabilityWorkspaceWrite, CapabilityExecute, CapabilityRuntimeCreate:
+	case CapabilityWorkspaceRead, CapabilityWorkspaceWrite, CapabilityExecute, CapabilityProcessControl, CapabilityRuntimeCreate:
 		if request.Target != TargetTaskWorkspace && request.Target != TargetRuntime {
 			return ErrDenied
 		}

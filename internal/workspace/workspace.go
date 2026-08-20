@@ -129,6 +129,15 @@ func (r *Repository) SourceFilesystemIdentity() string { return r.filesystemID }
 
 func (r *Repository) LiveRoot() string { return r.root }
 
+// SnapshotPath computes the same candidate snapshot used by generation
+// materialization and refresh. It is read-only and uses the shared walker.
+func SnapshotPath(ctx context.Context, root string) (string, error) {
+	if ctx == nil || root == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root {
+		return "", ErrRejected
+	}
+	return snapshotTree(ctx, root)
+}
+
 // Close releases the authority descriptor for the live repository.
 func (r *Repository) Close() error {
 	r.mu.Lock()
@@ -294,6 +303,57 @@ func (r *Repository) ReleaseLease(ctx context.Context, lease Lease) error {
 		return ErrRejected
 	}
 	return syncDirectory(generation.Path)
+}
+
+// DiscardGeneration permanently removes an isolated candidate only after its
+// lease has been released. It never touches the live repository.
+func (r *Repository) DiscardGeneration(ctx context.Context, generationID string) error {
+	if ctx == nil || r == nil || !validGenerationID(generationID) {
+		return ErrRejected
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.rootFD == nil {
+		return ErrRejected
+	}
+	path := filepath.Join(r.workspaceRoot, generationID)
+	if pathWithin(r.root, path) {
+		return ErrRejected
+	}
+	if _, err := os.Stat(filepath.Join(path, ".lease.json")); err == nil {
+		return ErrLeaseBusy
+	}
+	if err := os.RemoveAll(path); err != nil {
+		return ErrRejected
+	}
+	return syncDirectory(r.workspaceRoot)
+}
+
+// RefreshGeneration records the new candidate snapshot after a mutation that
+// was performed inside the generation. It never touches the live repository;
+// the active lease remains the mutation fence for the metadata update.
+func (r *Repository) RefreshGeneration(ctx context.Context, generation Generation, lease Lease) (Generation, error) {
+	if err := r.AssertGeneration(ctx, generation, lease); err != nil {
+		return Generation{}, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if ctx == nil || r.rootFD == nil {
+		return Generation{}, ErrRejected
+	}
+	loaded, err := r.loadGeneration(generation.ID)
+	if err != nil || loaded.Path != generation.Path {
+		return Generation{}, ErrStaleFence
+	}
+	snapshot, err := snapshotTree(ctx, loaded.Path)
+	if err != nil || snapshot == "" {
+		return Generation{}, ErrRejected
+	}
+	loaded.CandidateSnapshot = snapshot
+	if err := writeJSONAtomic(filepath.Join(loaded.Path, ".generation.json"), loaded, 0o600); err != nil {
+		return Generation{}, ErrRejected
+	}
+	return loaded, nil
 }
 
 // AssertLease is the mutation fence used by integration and runtime layers.
