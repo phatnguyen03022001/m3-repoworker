@@ -45,8 +45,12 @@ The configured local tunnel uses the `local-stdio` profile at
 
 ```text
 /Users/tienphat/Developer/m3-repoworker/bin/repoworker \
-  -repo-root /Users/tienphat/Developer/m3-repoworker
+  -repo-root /Users/tienphat/Developer/m3-repoworker \
+  -state-dir /Users/tienphat/.repoworker-state
 ```
+
+The restart scripts supply the explicit `-state-dir` override so stale state
+does not prevent MCP startup.
 
 Build and verify the binary before starting or restarting the tunnel:
 
@@ -61,6 +65,18 @@ stops the old listener, and starts a single tunnel on `127.0.0.1:8080`:
 ```sh
 ./scripts/restart-local-tunnel.sh
 ```
+
+For a one-command local reset, use the reset wrapper. It verifies and rebuilds
+the binary, moves the selected state directory to a timestamped backup, starts
+with a fresh state directory outside the repository, and waits for tunnel
+readiness:
+
+```sh
+./scripts/reset-local.sh
+```
+
+Set `REPOWORKER_STATE_DIR` to choose a different private state location. The
+old state is moved aside and is not deleted.
 
 The equivalent direct start command, when `CONTROL_PLANE_API_KEY` is already
 exported in the shell, is:
