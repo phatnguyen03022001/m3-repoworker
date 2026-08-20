@@ -34,6 +34,9 @@ The current M3.1 substrate consists of:
 - `internal/loop`: fixed typed autonomous coding loop with persisted phase
   transitions, bounded retries, failure taxonomy, binding checks, and human
   checkpoints for ambiguous or destructive plans.
+- `internal/publication`: dry-run-first Git/jj, GitHub CLI, release, Dagger,
+  and Dagu adapters with candidate revalidation, least-privilege gates,
+  remote ref checks, and explicit external confirmation.
 
 M3.2–M3.10 will bind authenticated principals, capabilities, process/runtime
 backends, resource admission, verification, events, autonomous-loop state,

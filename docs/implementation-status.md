@@ -165,3 +165,19 @@
   explicit confirmation.
 - Exact next action: define the publication authority and adapters, then add
   local bare-remote, fake-CLI, dry-run, and authorization tests.
+
+## M3.10 — IN PROGRESS
+
+- State: verified publication adapters implemented; awaiting full repository
+  verification and final local checkpoint on `main`.
+- Scope: Git and jj local checkpoints, Git push, GitHub PR via fixed `gh` command,
+  release, Dagger, and Dagu adapters; candidate snapshot revalidation, remote
+  ref race check, dry-run default, disabled-by-default external mutation,
+  scoped confirmation token, and credential-free command arguments.
+- Tests: fake CLI/dry-run authorization tests plus a local bare Git remote
+  fixture cover stale candidates, remote recheck, push result, and token gates.
+- Decisions: see `docs/adr/0010-m3.10-publication.md`.
+- Remaining: full repository verification, local M3.10 checkpoint, final
+  status update, and clean working-tree handoff without pushing.
+- Exact next action: run `make verify` and `govulncheck`, checkpoint M3.10,
+  and perform final clean-main verification.

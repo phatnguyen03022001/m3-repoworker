@@ -27,3 +27,9 @@ revalidated against the run binding before the local authority executes them.
 Failed action fingerprints are persisted, so a retry cannot repeat the same
 failed action; the retry budget is bounded and exhausted loops fail closed.
 Destructive or ambiguous plans stop at a human checkpoint.
+
+Publication adapters revalidate the verified candidate immediately before and
+after a mutation. Git push also reads the expected remote ref immediately
+before the push and fails closed on a mismatch. All external adapters are
+disabled unless explicitly enabled, default to dry-run, and require a scoped
+confirmation token; credentials are never placed in command arguments.
