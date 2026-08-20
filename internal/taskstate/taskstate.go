@@ -102,9 +102,9 @@ func DefaultStateDir() (string, error) {
 	return filepath.Join(base, "m3-repoworker", "tasks"), nil
 }
 
-// New constructs a task store using a resolved, fixed Git executable and
-// read-only Git metadata inspection.
-func New(repoRoot, repoFSID, stateRoot string) (*Store, error) {
+// New constructs the production SQLite task store using a resolved, fixed Git
+// executable and read-only Git metadata inspection.
+func New(repoRoot, repoFSID, stateRoot string) (*SQLiteStore, error) {
 	canonicalRepo, err := canonicalDirectory(repoRoot, false)
 	if err != nil || !pathMatchesFilesystemIdentity(canonicalRepo, repoFSID) {
 		return nil, ErrRejected
@@ -123,7 +123,7 @@ func New(repoRoot, repoFSID, stateRoot string) (*Store, error) {
 	if err != nil || !filepath.IsAbs(gitPath) {
 		return nil, ErrRejected
 	}
-	return newBoundWithInspector(canonicalRepo, repoFSID, stateRoot, gitInspector{executable: gitPath, repoFSID: repoFSID})
+	return newSQLiteWithInspector(canonicalRepo, repoFSID, stateRoot, gitInspector{executable: gitPath, repoFSID: repoFSID})
 }
 
 // NewWithInspector exists so tests can exercise persistence without executing
