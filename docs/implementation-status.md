@@ -78,15 +78,16 @@ mutating request and observes no duplicate workspace side effect.
   the required toolchain. Registry/full runtime networking remains fail closed
   until domain filtering is implemented.
 - The local tunnel is an external connector process. If it caches an older MCP
-  schema, reconnect/re-add the connector and open a new session. The final
-  fresh session used for this checkpoint exposed exactly the 31 tools listed in
-  README, including `repo_git_status`, and no `confirmation_issue`.
+  schema, reconnect/re-add the connector and open a new session. The tunnel
+  has been rebuilt/restarted with the current binary; a fresh frontend
+  mutation probe remains part of live evidence because the connector is
+  external to this repository.
 
 ## Current source checkpoint
 
-The verified implementation checkpoint is local commit
-`92a1dc7` (`m3: enable container-confined development shell`) on `main`.
-The final documentation/evidence commit is recorded by the handoff after the
-source checkpoint has passed the fresh live-session probe. No remote has been
-updated.
-No remote push, PR, release, or deployment is part of this work.
+The current source checkpoint is local commit
+`163ee77` (`fix: derive MCP replay identity from transport requests`) on
+`main`. Automated, real Apple, real M3 E2E, and local wire-level replay gates
+are green. The external frontend mutation probe must still be observed before
+calling the live connector evidence complete. No remote push, PR, release, or
+deployment is part of this checkpoint.
