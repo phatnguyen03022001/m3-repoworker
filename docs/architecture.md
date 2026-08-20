@@ -26,6 +26,8 @@ The current M3.1 substrate consists of:
 - `internal/environment`: deterministic toolchain/lockfile identities,
   environment generations, registry-only installer boundary, and verified
   non-authoritative cache.
+- `internal/intelligence`: native ecosystem detection, typed targeted/full
+  verification plans, and candidate/environment/policy-bound results.
 
 M3.2–M3.10 will bind authenticated principals, capabilities, process/runtime
 backends, resource admission, verification, events, autonomous-loop state,

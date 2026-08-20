@@ -109,3 +109,18 @@
   candidate/environment/policy-bound verification.
 - Exact next action: implement native Go/Node/Rust/Nx/Turbo/Bazel detection,
   targeted/full verification plans, and invalidate results on snapshot change.
+
+## M3.7 — IN PROGRESS
+
+- State: repository intelligence and bound verification implemented locally;
+  verification and checkpoint pending.
+- Scope: native ecosystem detection, package-manager selection, targeted/
+  affected/full command plans, candidate snapshot checks before/after
+  execution, environment/policy binding, and stale-result invalidation.
+- Tests: intelligence fixtures cover all six supported ecosystems, native
+  command selection, target validation, failure redaction, and TOCTOU snapshot
+  changes.
+- Decisions: see `docs/adr/0007-m3.7-bound-verification.md`.
+- Remaining: run full verification and checkpoint on `main`.
+- Exact next action: run `make verify`, `govulncheck ./...`, inspect the diff,
+  and commit `m3.7: repository intelligence and verification`.
