@@ -59,8 +59,9 @@ func NewDefaultRequestReplayCache() *RequestReplayCache {
 	return cache
 }
 
-// Accept records one mutating request. Request IDs and sequences are supplied
-// through the MCP SDK's actual CallToolParams._meta field; they are not tool
+// Accept records one mutating request. The MCP receiving boundary derives the
+// request ID and sequence from the actual JSON-RPC transport request and puts
+// them in private SDK metadata before this cache is called; they are not tool
 // arguments or invented HTTP headers. Reusing either identity in one bound
 // session is rejected.
 func (c *RequestReplayCache) Accept(transportID, authSessionID, principalID, mcpSessionID, requestID string, sequence uint64) error {

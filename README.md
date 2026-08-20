@@ -149,11 +149,13 @@ generation, fencing, candidate snapshot, plan digest, expiry và one-time
 consumption; replay, scope change, restart và concurrent consume đều fail
 closed.
 
-Mutating MCP calls carry `repoworker/request_id` and
-`repoworker/request_sequence` in the SDK `_meta`; the bounded cache rejects
-same-request replay. A restart starts a fresh authenticated session/cache and
-requires a fresh MCP session. The signed HTTP nonce marks credential
-uniqueness; it is not itself the consumed request replay cache.
+The MCP receiving boundary derives private `repoworker/request_id` and
+`repoworker/request_sequence` metadata from the actual JSON-RPC request ID and
+canonical call payload; callers do not need to manufacture these keys. The
+bounded cache rejects same-wire-request replay. A restart starts a fresh
+authenticated session/cache and requires a fresh MCP session. The signed HTTP
+nonce marks credential uniqueness; it is not itself the consumed request replay
+cache.
 
 Verification bind repository, candidate snapshot, environment, và policy.
 MCP output dùng opaque IDs và `/workspace`; không trả về state path hay spill

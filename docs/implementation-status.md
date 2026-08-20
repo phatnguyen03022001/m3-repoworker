@@ -30,8 +30,9 @@ MCP adapter. It includes:
 - a real private operator Unix socket and `operator-approve` CLI with private
   `0700`/`0600` state permissions, independent HMAC operator authentication,
   pending-plan binding, atomic one-time consumption, and restart invalidation;
-- MCP receiving-boundary replay protection using SDK `_meta` request identity,
-  SDK session handle, authenticated transport/session/principal binding, and a
+- MCP receiving-boundary replay protection derives SDK `_meta` request identity
+  from the actual JSON-RPC request ID and canonical call payload, then binds it
+  to the SDK session handle and authenticated transport/session/principal in a
   bounded cache. Signed HTTP credential nonces are documented as uniqueness
   markers rather than consumed transport replay state.
 

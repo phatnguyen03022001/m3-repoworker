@@ -124,13 +124,13 @@ Network mode is `none` by default. `registry` and `full` requests are rejected
 until an Apple adapter can enforce domain filtering; RepoWorker does not widen
 network access as a substitute.
 
-Mutating MCP calls must carry the SDK request metadata keys
-`repoworker/request_id` and `repoworker/request_sequence` in
-`CallToolParams._meta`. The bounded process-local cache rejects duplicate
-request IDs in any bound session and duplicate sequences in one MCP session.
-Restart creates a fresh authenticated control-plane session and replay cache;
-callers must establish a fresh MCP session and request sequence. The signed
-HTTP credential nonce is a credential-uniqueness marker, not a consumed
+The MCP receiving boundary derives the private SDK `_meta` replay keys from
+the actual JSON-RPC request ID and canonical `tools/call` payload. Callers do
+not need to manufacture RepoWorker metadata. The bounded process-local cache
+rejects a duplicate wire request identity and duplicate transport sequence in
+one bound MCP session. Restart creates a fresh authenticated control-plane
+session and replay cache; callers must establish a fresh MCP session. The
+signed HTTP credential nonce is a credential-uniqueness marker, not a consumed
 transport replay cache.
 
 `repo_git_status` is read-only and bounded: it returns deterministic sorted

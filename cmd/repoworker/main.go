@@ -533,6 +533,7 @@ func runWithProvider(ctx context.Context, transport mcp.Transport, repoRoot, sta
 }
 
 func runWithProviderAndSocket(ctx context.Context, transport mcp.Transport, repoRoot, stateRoot string, provider security.PrincipalProvider, socketPath string) error {
+	transport = &replayMetadataTransport{delegate: transport}
 	key, err := ensureOperatorKey(stateRoot)
 	if err != nil {
 		return errRequestRejected
