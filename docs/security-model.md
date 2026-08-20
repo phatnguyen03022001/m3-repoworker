@@ -16,3 +16,9 @@ A lease is an expiring ownership record with a monotonic fence. An expired
 lease quarantines the generation; an old lease cannot renew, reserve a runtime,
 or mutate the live repository. Candidate and base digests prevent TOCTOU
 integration. Full principal/capability policy is the M3.2 boundary.
+
+M3.2 adds repository enrollment bound to repository/filesystem identities,
+single-use session nonces, typed mount/network/execution compilation, and
+one-time confirmation tokens for destructive and publication classes. A live
+repository cannot be compiled as a runtime mount, full network is denied, and
+host shell executables are rejected. Audit detail is bounded and redacted.

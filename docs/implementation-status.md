@@ -18,3 +18,19 @@
   confirmation classes.
 - Exact next action: inspect the current security boundary and implement the
   M3.2 policy compiler and its adversarial tests on local `main`.
+
+## M3.2 — IN PROGRESS
+
+- State: typed security authority implemented locally; verification and
+  checkpoint pending.
+- Scope: deny-by-default capabilities, repository enrollment and trusted
+  integration references, principal/session binding, nonce replay protection,
+  confirmation classes, mount/network/execution compilation, credential
+  references, and redacted audit events.
+- Tests: adversarial unit tests cover deny-by-default, replay, TOCTOU-bound
+  enrollment, live/workspace overlap, full-network and host-shell rejection,
+  confirmation reuse, and redaction.
+- Decisions: see `docs/adr/0002-m3.2-typed-execution-security.md`.
+- Remaining: run the full M3.2 verification gate, then checkpoint on `main`.
+- Exact next action: run `make verify`, `govulncheck ./...`, inspect the diff,
+  and commit `m3.2: execution security policy`.
